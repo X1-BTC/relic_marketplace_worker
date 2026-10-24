@@ -1,0 +1,20 @@
+{
+  "name": "relic-marketplace-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.22.1 <25"
+  },
+  "scripts": {
+    "build": "npm run check:marketplace-worker",
+    "check:marketplace-worker": "node scripts/check-marketplace-worker.mjs",
+    "start:marketplace-worker": "node --max-old-space-size=192 indexer/worker.mjs",
+    "start": "node --max-old-space-size=192 indexer/worker.mjs"
+  },
+  "dependencies": {
+    "ethers": "6.17.0",
+    "pg": "8.23.1",
+    "viem": "2.39.0"
+  }
+}
