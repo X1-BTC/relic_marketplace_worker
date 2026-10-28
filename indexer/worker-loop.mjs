@@ -1,4 +1,3 @@
-
 import {setTimeout as delay} from 'node:timers/promises';
 import {PostgresMarketplaceWriter} from './postgres-writer.mjs';
 import {indexOnce} from './run-once.mjs';
@@ -16,19 +15,8 @@ const safeFailures=new Map([
   ['Reorg: explicit recovery required','REORG_ANCHOR_MISMATCH'],['Reorg: recovery required','REORG_ANCHOR_MISMATCH'],
   ['Reorg during collection','REORG_DURING_COLLECTION'],['Reorg below anchor: reviewed replacement required','REORG_RECOVERY_BELOW_ANCHOR'],
 ]);
-
 const safeCodes=new Set(['WS_ENDPOINT_INVALID','WS_MARKETPLACE_ADDRESS_INVALID','WS_RUNTIME_UNAVAILABLE','WS_ABORTED','WS_CONNECT_FAILED','WS_SUBSCRIBE_SEND_FAILED','WS_SUBSCRIBE_REJECTED','WS_CLOSED','WS_CONNECT_TIMEOUT','WS_SOCKET_ERROR','WS_SOCKET_CLOSED','WS_WORKER_STOP','DATABASE_SESSION_LOST','DATABASE_SESSION_UNAVAILABLE','DATABASE_TLS_UNVERIFIED','DATABASE_IDENTITY_INVALID','DATABASE_OWNER_ROLE','DATABASE_QUERY_FAILED','DATABASE_CONNECT_FAILED','RPC_CHAIN_MISMATCH','CONFIG_INVALID','DEDICATED_ALCHEMY_HTTP_REQUIRED','DEDICATED_ALCHEMY_WS_REQUIRED','REORG_RECOVERY_FAILED']);
 const workerCode=e=>safeCodes.has(e?.code)?e.code:safeFailures.get(e?.message)??'WORKER_CYCLE_FAILED';
-
-// Diagnostic temporaire : masque les secrets courants avant journalisation.
-function safeErrorMessage(error) {
-  const message=error instanceof Error?error.message:String(error);
-  return message
-    .replace(/(?:https?|wss?):\/\/[^\s"'<>]+/gi,'[URL_REDACTED]')
-    .replace(/0x[a-fA-F0-9]{40,}/g,'[HEX_REDACTED]')
-    .replace(/(?:password|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+/gi,'[SECRET_REDACTED]')
-    .slice(0,500);
-}
 
 function wakeQueue() {
   let pending=false,removed=false,waiter=null;
@@ -59,7 +47,6 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
   const wake=wakeQueue();
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
   let reconnectFailures=0,nextReconnectAt=0,nextFallbackAt=0,lastCheckpoint=null,lastHead=null,checkpointStallAt=null,stallAlerted=false;
-
   const connect=async()=>{
     try{
       handle=await openSubscription({
@@ -117,9 +104,6 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     let batches=0;
     while(!cycleSignal.aborted){
       let result;
-      // The deployment checkpoint is B-1 (version 0), where Marketplace bytecode
-      // is correctly absent. Keep canonical anchor/chain checks, but defer the
-      // Marketplace runtime attestation until the first confirmed post-B batch.
       const attestIdle=verifyIdle===true&&BigInt(cp.version)>0n;
       try{result=await indexOnce({client,writer,confirmations:config.confirmations,batchSize:config.batchSize,checkpoint:cp,head,verifyIdle:attestIdle});}
       catch(error){
@@ -151,45 +135,43 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     return {checkpoint:cp,head,lag,batches};
   };
 
-  // Subscribe first, then read from the durable checkpoint. Signals arriving
-  // during catch-up are coalesced and cause another canonical HTTP pass.
   try{
-    await connect();
-    if(cycleSignal.aborted)return {aborted:true};
-    nextFallbackAt=Date.now()+config.wsFallbackMs;
-    await catchUp({verifyIdle:true});onHealthy?.();
+  await connect();
+  if(cycleSignal.aborted)return {aborted:true};
+  nextFallbackAt=Date.now()+config.wsFallbackMs;
+  await catchUp({verifyIdle:true});onHealthy?.();
 
-    while(!cycleSignal.aborted){
-      const now=Date.now();
-      if(!wsConnected&&disconnectedAt&&now-disconnectedAt>=config.alertStallMs&&!disconnectAlerted){
-        disconnectAlerted=true;log('alert',{code:'WS_DISCONNECTED_TOO_LONG',durationMs:now-disconnectedAt});
-      }
-      if(!wsConnected&&now>=nextReconnectAt){
-        if(handle){try{await handle.close();}catch{}handle=null;}
-        const connected=await connect();
-        if(connected){nextFallbackAt=Date.now()+config.wsFallbackMs;await catchUp({verifyIdle:true});onHealthy?.();continue;}
-      }
-      if(now>=nextFallbackAt){
-        await catchUp({verifyIdle:true});
-        onHealthy?.();
-        nextFallbackAt=Date.now()+config.wsFallbackMs;
-        continue;
-      }
-      const reconnectDelayMs=!wsConnected?Math.max(1,nextReconnectAt-Date.now()):Infinity;
-      const timeout=Math.max(1,Math.min(nextFallbackAt-Date.now(),reconnectDelayMs));
-      const signalResult=await wake.take(timeout,cycleSignal,handle?.closed);
-      if(signalResult.kind==='aborted')break;
-      if(signalResult.kind==='closed'){
-        try{await handle?.close();}catch{}
-        handle=null;wsConnected=false;disconnectedAt??=Date.now();
-        continue;
-      }
-      if(signalResult.kind==='timeout')continue;
-      const caught=await catchUp({verifyIdle:signalResult.removed});
-      onHealthy?.();
-      if(signalResult.removed)log('reorg_signal',{checkpoint:String(caught.checkpoint.block_number)});
+  while(!cycleSignal.aborted){
+    const now=Date.now();
+    if(!wsConnected&&disconnectedAt&&now-disconnectedAt>=config.alertStallMs&&!disconnectAlerted){
+      disconnectAlerted=true;log('alert',{code:'WS_DISCONNECTED_TOO_LONG',durationMs:now-disconnectedAt});
     }
-    return {aborted:true};
+    if(!wsConnected&&now>=nextReconnectAt){
+      if(handle){try{await handle.close();}catch{}handle=null;}
+      const connected=await connect();
+      if(connected){nextFallbackAt=Date.now()+config.wsFallbackMs;await catchUp({verifyIdle:true});onHealthy?.();continue;}
+    }
+    if(now>=nextFallbackAt){
+      await catchUp({verifyIdle:true});
+      onHealthy?.();
+      nextFallbackAt=Date.now()+config.wsFallbackMs;
+      continue;
+    }
+    const reconnectDelayMs=!wsConnected?Math.max(1,nextReconnectAt-Date.now()):Infinity;
+    const timeout=Math.max(1,Math.min(nextFallbackAt-Date.now(),reconnectDelayMs));
+    const signalResult=await wake.take(timeout,cycleSignal,handle?.closed);
+    if(signalResult.kind==='aborted')break;
+    if(signalResult.kind==='closed'){
+      try{await handle?.close();}catch{}
+      handle=null;wsConnected=false;disconnectedAt??=Date.now();
+      continue;
+    }
+    if(signalResult.kind==='timeout')continue;
+    const caught=await catchUp({verifyIdle:signalResult.removed});
+    onHealthy?.();
+    if(signalResult.removed)log('reorg_signal',{checkpoint:String(caught.checkpoint.block_number)});
+  }
+  return {aborted:true};
   }finally{try{await handle?.close();}catch{}}
 }
 
@@ -213,12 +195,7 @@ export async function runWorker({config,pool,makeClient,signal,log,onSession,ope
       if(bytecodeMismatch(error)){log('fatal',{code:'CONTRACT_BYTECODE_MISMATCH'});throw new WorkerFault('CONTRACT_BYTECODE_MISMATCH',{fatal:true});}
       failures++;
       const wait=jitter(Math.min(config.retryMaxMs,config.retryMinMs*2**Math.min(failures-1,10)));
-      log('retry',{
-        attempt:failures,
-        delayMs:wait,
-        code:workerCode(error),
-        errorMessage:safeErrorMessage(error)
-      });
+      log('retry',{attempt:failures,delayMs:wait,code:workerCode(error)});
       session?.close();onSession(null);
       await sleep(wait,signal);
     }finally{session?.close();onSession(null);}
