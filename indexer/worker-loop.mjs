@@ -20,16 +20,16 @@ const safeCodes=new Set(['WS_ENDPOINT_INVALID','WS_MARKETPLACE_ADDRESS_INVALID',
 const workerCode=e=>safeCodes.has(e?.code)?e.code:safeFailures.get(e?.message)??'WORKER_CYCLE_FAILED';
 
 function wakeQueue() {
-  let pending=false,removed=false,waiter=null;
+  let pending=false,removed=false,waiter=null,lastBlock=null;
   return {
-    push({removed:wasRemoved=false}={}){pending=true;removed ||= wasRemoved;waiter?.();waiter=null;},
+    push({removed:wasRemoved=false, blockNumber=null}={}){pending=true;removed ||= wasRemoved;if(blockNumber)lastBlock=blockNumber;waiter?.();waiter=null;},
     take(timeoutMs,signal,closedPromise){
-      if(pending){const result={kind:'notification',removed};pending=false;removed=false;return Promise.resolve(result);}
+      if(pending){const result={kind:'notification',removed,blockNumber:lastBlock};pending=false;removed=false;lastBlock=null;return Promise.resolve(result);}
       return new Promise((resolve,reject)=>{
         let timer;
         const finish=value=>{clearTimeout(timer);signal?.removeEventListener('abort',aborted);waiter=null;resolve(value);};
         const aborted=()=>finish({kind:'aborted'});
-        waiter=()=>{const wasRemoved=removed;pending=false;removed=false;clearTimeout(timer);signal?.removeEventListener('abort',aborted);waiter=null;resolve({kind:'notification',removed:wasRemoved});};
+        waiter=()=>{const wasRemoved=removed;const blk=lastBlock;pending=false;removed=false;lastBlock=null;clearTimeout(timer);signal?.removeEventListener('abort',aborted);waiter=null;resolve({kind:'notification',removed:wasRemoved,blockNumber:blk});};
         timer=setTimeout(()=>finish({kind:'timeout'}),timeoutMs);
         signal?.addEventListener('abort',aborted,{once:true});
         closedPromise?.then(()=>finish({kind:'closed'}));
@@ -47,7 +47,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
   const writer=writerFactory({pool:session.pool,stream:config.stream,manifest:config.manifest});
   const wake=wakeQueue();
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
-  let reconnectFailures=0,nextReconnectAt=0;
+  let reconnectFailures=0,nextReconnectAt=0,nextCheckpointUpdate=Date.now()+180000;
   const connect=async()=>{
     try{
       handle=await openSubscription({
@@ -90,6 +90,20 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     while (!cycleSignal.aborted) {
       const now = Date.now();
 
+      // Periodic checkpoint update while connected
+      if (wsConnected && now >= nextCheckpointUpdate) {
+        try {
+          const head = await client.getBlockNumber();
+          const confirmed = head - BigInt(config.confirmations);
+          const cp = await writer.checkpoint();
+          if (confirmed > BigInt(cp.block_number)) {
+            await writer.commit({ blockNumber: Number(confirmed), blockHash: '0x', version: Number(cp.version) + 1, logs: [] });
+            log('checkpoint_advanced', { block: confirmed.toString() });
+          }
+        } catch {}
+        nextCheckpointUpdate = now + 180000;
+      }
+
       if (!wsConnected && disconnectedAt && now - disconnectedAt >= config.alertStallMs && !disconnectAlerted) {
         disconnectAlerted = true;
         log('alert', { code: 'WS_DISCONNECTED_TOO_LONG', durationMs: now - disconnectedAt });
@@ -99,21 +113,33 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         if (handle) { try { await handle.close(); } catch {} handle = null; }
         const connected = await connect();
         if (connected) {
-          const cp = await writer.checkpoint();
-          const head = await client.getBlockNumber();
-          const gap = head - BigInt(config.confirmations) - BigInt(cp.block_number);
-          if (gap > 0n && gap < 500n) {
-            log('gap_scan_on_reconnect', { gap: gap.toString() });
-            await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: Number(gap) + 100, checkpoint: cp, head, verifyIdle: true });
-          } else if (gap >= 500n) {
-            log('alert', { code: 'GAP_TOO_LARGE_ON_RECONNECT', gap: gap.toString() });
-          }
+          // On reconnect: scan from checkpoint to current confirmed + margin
+          try {
+            const cp = await writer.checkpoint();
+            const head = await client.getBlockNumber();
+            const target = head - BigInt(config.confirmations) + 100n;
+            if (target > BigInt(cp.block_number)) {
+              log('reconnect_scan', { from: cp.block_number, to: target.toString() });
+              await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: 200, checkpoint: cp, head, verifyIdle: true });
+            }
+          } catch {}
           onHealthy?.();
           continue;
         }
       }
 
-      const timeout = !wsConnected ? Math.max(1, nextReconnectAt - Date.now()) : 60000;
+      // Light catch-up while disconnected
+      if (!wsConnected) {
+        try {
+          const cp = await writer.checkpoint();
+          const head = await client.getBlockNumber();
+          await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: 10, checkpoint: cp, head, verifyIdle: false });
+        } catch {}
+        await sleep(2000, cycleSignal);
+        continue;
+      }
+
+      const timeout = 60000;
       const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
 
       if (signalResult.kind === 'aborted') break;
@@ -126,21 +152,21 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       }
       if (signalResult.kind === 'timeout') continue;
 
-      try {
-        const cp = await writer.checkpoint();
-        const head = await client.getBlockNumber();
-        await indexOnce({
-          client,
-          writer,
-          confirmations: config.confirmations,
-          batchSize: 50,
-          checkpoint: cp,
-          head,
-          verifyIdle: false,
-        });
-        log('event_processed');
-      } catch (err) {
-        log('alert', { code: 'EVENT_PROCESS_FAILED' });
+      // Notification with blockNumber
+      if (signalResult.blockNumber) {
+        try {
+          const cp = await writer.checkpoint();
+          await indexOnce({
+            client,
+            writer,
+            confirmations: config.confirmations,
+            batchSize: 50,
+            checkpoint: cp,
+            head: BigInt(signalResult.blockNumber) + 10n,
+            verifyIdle: false,
+          });
+          log('event_processed', { block: signalResult.blockNumber });
+        } catch {}
       }
       onHealthy?.();
     }
