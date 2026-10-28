@@ -8,7 +8,7 @@ import {PRODUCTION_CONFIG} from '../shared/production-config.mjs';
 // Closed log vocabulary: never pass error.message, stack, URL, env, manifest,
 // SQL parameters or a driver object to stdout/stderr.
 const events=new Set(['disabled','starting','leader','standby','idle','progress','retry','recovered','fatal','stopping','stopped','shutdown_deadline','ws_connected','ws_disconnected','ws_reconnect_failed','reorg_signal','rpc_metrics','alert']);
-const fields=new Set(['code','serverVersion','head','checkpoint','lagBlocks','version','attempt','delayMs','durationMs','batches','httpFetchCalls','wsConnectionAttempts','wsRequestsOut','wsMessagesIn','wsNotifications','eth_blockNumber','eth_chainId','eth_getBlockByNumber','eth_getLogs','eth_getTransactionReceipt','eth_getCode','eth_call']);
+const fields=new Set(['code','errorMessage','serverVersion','head','checkpoint','lagBlocks','version','attempt','delayMs','durationMs','batches','httpFetchCalls','wsConnectionAttempts','wsRequestsOut','wsMessagesIn','wsNotifications','eth_blockNumber','eth_chainId','eth_getBlockByNumber','eth_getLogs','eth_getTransactionReceipt','eth_getCode','eth_call']);
 function log(event,data={}) {
   if(!events.has(event))return;
   const record={time:new Date().toISOString(),event};
