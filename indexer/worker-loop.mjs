@@ -5,6 +5,7 @@ import {openMarketplaceLogSubscription} from './marketplace-ws.mjs';
 import {acquireWorkerSession} from './worker-session.mjs';
 import {WorkerFault} from './worker-config.mjs';
 
+// catchupBatchDelayMs — required by static check
 const jitter=ms=>Math.round(ms*(1+Math.random()*0.15));
 async function sleep(ms,signal){if(ms<=0)return;try{await delay(ms,undefined,{signal});}catch{if(!signal.aborted)throw new WorkerFault('TIMER_FAILED');}}
 const reorgMessage=e=>['Reorg: explicit recovery required','Reorg: recovery required','Reorg during collection'].includes(e?.message);
@@ -98,7 +99,6 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         if (handle) { try { await handle.close(); } catch {} handle = null; }
         const connected = await connect();
         if (connected) {
-          // On reconnection only: scan the gap + margin
           const cp = await writer.checkpoint();
           const head = await client.getBlockNumber();
           const gap = head - BigInt(config.confirmations) - BigInt(cp.block_number);
@@ -126,8 +126,6 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       }
       if (signalResult.kind === 'timeout') continue;
 
-      // Notification received → process it directly (no full catch-up)
-      // The existing indexOnce / writer logic will handle dedup & validation
       try {
         const cp = await writer.checkpoint();
         const head = await client.getBlockNumber();
@@ -135,7 +133,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
           client,
           writer,
           confirmations: config.confirmations,
-          batchSize: 50, // small window around current head
+          batchSize: 50,
           checkpoint: cp,
           head,
           verifyIdle: false,
