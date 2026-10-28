@@ -200,7 +200,7 @@ export async function runWorker({config,pool,makeClient,signal,log,onSession,ope
       if(bytecodeMismatch(error)){log('fatal',{code:'CONTRACT_BYTECODE_MISMATCH'});throw new WorkerFault('CONTRACT_BYTECODE_MISMATCH',{fatal:true});}
       failures++;
       const wait=jitter(Math.min(config.retryMaxMs,config.retryMinMs*2**Math.min(failures-1,10)));
-      log('retry',{attempt:failures,delayMs:wait,code:workerCode(error)});
+      const rawMessage = error instanceof Error   ? error.message   : String(error);  const safeMessage = rawMessage   .replace(/https?:\/\/\S+/gi, '[URL_REDACTED]')   .replace(/wss?:\/\/\S+/gi, '[WS_URL_REDACTED]')   .replace(/0x[a-fA-F0-9]{40,}/g, '[HEX_REDACTED]')   .replace(/(?:password|token|api[_-]?key|secret)\s*[:=]\s*\S+/gi, '[SECRET_REDACTED]')   .slice(0, 500);  log('retry', {   attempt: failures,   delayMs: wait,   code: workerCode(error),   errorMessage: safeMessage });
       session?.close();onSession(null);
       await sleep(wait,signal);
     }finally{session?.close();onSession(null);}
