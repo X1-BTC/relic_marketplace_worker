@@ -3,7 +3,7 @@ import { openMarketplaceLogSubscription } from './marketplace-ws.mjs';
 
 // Observation only: no PostgreSQL, no HTTP RPC, no checkpoint, no backfill.
 const address = '0xb87bbab928495bec8085eca758660790a0c67f9f';
-const url = process.env.RM_ALCHEMY_WS_URL ?? process.env.ALCHEMY_WS_URL ?? process.env.RM_WS_RPC_URL;
+const url = process.env.RM_MARKETPLACE_ALCHEMY_WS_URL ?? process.env.RM_ALCHEMY_WS_URL ?? process.env.ALCHEMY_WS_URL ?? process.env.RM_WS_RPC_URL;
 if (!url) {
   console.error(JSON.stringify({ event: 'fatal', code: 'WS_URL_MISSING' }));
   process.exit(1);
