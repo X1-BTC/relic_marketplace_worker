@@ -46,7 +46,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
   const writer=writerFactory({pool:session.pool,stream:config.stream,manifest:config.manifest});
   const wake=wakeQueue();
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
-  let reconnectFailures=0,nextReconnectAt=0,nextFallbackAt=0,lastCheckpoint=null,lastHead=null,checkpointStallAt=null,stallAlerted=false;
+  let reconnectFailures=0,nextReconnectAt=0;
   const connect=async()=>{
     try{
       handle=await openSubscription({
@@ -79,69 +79,11 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     }
   };
 
-  const maybeLogMetrics=()=>{
-    const counts=metrics?.snapshot?.({reset:true});
-    if(counts)log('rpc_metrics',counts);
-  };
-
-  const observeProgress=(cp,head)=>{
-    const checkpoint=BigInt(cp.block_number),currentHead=BigInt(head);
-    const lag=currentHead>BigInt(config.confirmations)+checkpoint?currentHead-BigInt(config.confirmations)-checkpoint:0n;
-    const cpText=checkpoint.toString(),headText=currentHead.toString();
-    if(lastCheckpoint!==cpText){lastCheckpoint=cpText;checkpointStallAt=null;stallAlerted=false;}
-    if(lastHead!==null&&currentHead>BigInt(lastHead)&&lag>0n){checkpointStallAt??=Date.now();}
-    if(lag>=BigInt(config.alertLagBlocks))log('alert',{code:'SYNC_LAG_HIGH',lagBlocks:lag.toString(),head:headText,checkpoint:cpText});
-    if(checkpointStallAt&&Date.now()-checkpointStallAt>=config.alertStallMs&&!stallAlerted){
-      stallAlerted=true;log('alert',{code:'CHECKPOINT_STALLED',lagBlocks:lag.toString(),head:headText,checkpoint:cpText,durationMs:Date.now()-checkpointStallAt});
-    }
-    lastHead=headText;
-  };
-
-  const catchUp=async({verifyIdle=false}={})=>{
-    let cp=await writer.checkpoint();
-    let head=await client.getBlockNumber();
-    observeProgress(cp,head);
-    let batches=0;
-    while(!cycleSignal.aborted){
-      let result;
-      const attestIdle=verifyIdle===true&&BigInt(cp.version)>0n;
-      try{result=await indexOnce({client,writer,confirmations:config.confirmations,batchSize:config.batchSize,checkpoint:cp,head,verifyIdle:attestIdle});}
-      catch(error){
-        if(!reorgMessage(error))throw error;
-        const fresh=await writer.checkpoint();
-        let recovered;
-        try{recovered=await writer.recover({client,expectedVersion:fresh.version});}
-        catch{log('alert',{code:'REORG_RECOVERY_FAILED'});throw new WorkerFault('REORG_RECOVERY_FAILED');}
-        if(!recovered.unchanged)log('recovered',{checkpoint:String(recovered.blockNumber),version:String(recovered.version)});
-        cp=await writer.checkpoint();head=await client.getBlockNumber();
-        continue;
-      }
-      if(result.idle)break;
-      batches++;
-      cp={...cp,block_number:String(result.blockNumber),block_hash:result.blockHash,version:String(result.version)};
-      head=await client.getBlockNumber();
-      observeProgress(cp,head);
-      const confirmed=head-BigInt(config.confirmations);
-      const lag=confirmed>BigInt(cp.block_number)?confirmed-BigInt(cp.block_number):0n;
-      log('progress',{head:head.toString(),checkpoint:String(cp.block_number),lagBlocks:lag.toString(),version:String(cp.version),batches});
-      if(lag===0n)break;
-      await sleep(config.catchupBatchDelayMs,cycleSignal);
-    }
-    const confirmed=head-BigInt(config.confirmations);
-    const lag=confirmed>BigInt(cp.block_number)?confirmed-BigInt(cp.block_number):0n;
-    if(lag===0n)log('idle',{head:head.toString(),checkpoint:String(cp.block_number),lagBlocks:'0',version:String(cp.version)});
-    observeProgress(cp,head);
-    maybeLogMetrics();
-    return {checkpoint:cp,head,lag,batches};
-  };
-
   // Subscribe first, then read from the durable checkpoint. Signals arriving
   // during catch-up are coalesced and cause another canonical HTTP pass.
   try {
     await connect();
     if (cycleSignal.aborted) return { aborted: true };
-    nextFallbackAt = Date.now() + config.wsFallbackMs;
-
     onHealthy?.();
 
     while (!cycleSignal.aborted) {
@@ -156,27 +98,22 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         if (handle) { try { await handle.close(); } catch {} handle = null; }
         const connected = await connect();
         if (connected) {
-          // On reconnection: scan gap + 100 blocks margin before and after
+          // On reconnection only: scan the gap + margin
           const cp = await writer.checkpoint();
           const head = await client.getBlockNumber();
-          const gapStart = BigInt(cp.block_number);
-          const gapEnd = head - BigInt(config.confirmations);
-          if (gapEnd > gapStart) {
-            const margin = 100n;
-            const from = gapStart > margin ? gapStart - margin : 0n;
-            const to = gapEnd + margin;
-            log('gap_scan', { from: from.toString(), to: to.toString(), gap: (gapEnd - gapStart).toString() });
-            // Limited catch-up for the gap window only
-            await catchUp({ verifyIdle: true });
+          const gap = head - BigInt(config.confirmations) - BigInt(cp.block_number);
+          if (gap > 0n && gap < 500n) {
+            log('gap_scan_on_reconnect', { gap: gap.toString() });
+            await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: Number(gap) + 100, checkpoint: cp, head, verifyIdle: true });
+          } else if (gap >= 500n) {
+            log('alert', { code: 'GAP_TOO_LARGE_ON_RECONNECT', gap: gap.toString() });
           }
           onHealthy?.();
           continue;
         }
       }
 
-      // No periodic fallback while WS is healthy
-      const reconnectDelayMs = !wsConnected ? Math.max(1, nextReconnectAt - Date.now()) : Infinity;
-      const timeout = Math.max(1, Math.min(60000, reconnectDelayMs));
+      const timeout = !wsConnected ? Math.max(1, nextReconnectAt - Date.now()) : 60000;
       const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
 
       if (signalResult.kind === 'aborted') break;
@@ -189,7 +126,25 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       }
       if (signalResult.kind === 'timeout') continue;
 
-      // WS notification while connected → do nothing
+      // Notification received → process it directly (no full catch-up)
+      // The existing indexOnce / writer logic will handle dedup & validation
+      try {
+        const cp = await writer.checkpoint();
+        const head = await client.getBlockNumber();
+        await indexOnce({
+          client,
+          writer,
+          confirmations: config.confirmations,
+          batchSize: 50, // small window around current head
+          checkpoint: cp,
+          head,
+          verifyIdle: false,
+        });
+        log('event_processed');
+      } catch (err) {
+        log('alert', { code: 'EVENT_PROCESS_FAILED' });
+      }
+      onHealthy?.();
     }
     return { aborted: true };
   } finally {
