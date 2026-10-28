@@ -17,12 +17,6 @@ const messageText=async data=>{
   return String(data);
 };
 
-/**
- * Opens exactly one eth_subscribe("logs", { address }) subscription. The
- * callback receives only a wake-up hint; payload fields are never forwarded to
- * the indexer or used as checkpoint evidence. Reconnection belongs to the
- * existing worker loop so every new subscription is followed by catch-up.
- */
 export async function openMarketplaceLogSubscription({url,address,WebSocketImpl=globalThis.WebSocket,onLog=()=>{},onState=()=>{},metrics,timeoutMs=15000,signal}) {
   const endpoint=validateEndpoint(url);
   if(!/^0x[0-9a-fA-F]{40}$/.test(address??''))throw fail('WS_MARKETPLACE_ADDRESS_INVALID');
@@ -51,7 +45,6 @@ export async function openMarketplaceLogSubscription({url,address,WebSocketImpl=
     let parsed;
     try{parsed=JSON.parse(await messageText(event.data));}catch{return;}
     if(parsed?.id===SUBSCRIBE_ID){
-      // Alchemy may return subscription IDs shorter than 32 bytes.
       if(parsed.error||typeof parsed.result!=='string'||!/^0x[0-9a-fA-F]+$/.test(parsed.result)){finish('WS_SUBSCRIBE_REJECTED');return;}
       subscriptionId=parsed.result;settled=true;
       try{onState('connected');}catch{}
@@ -60,11 +53,9 @@ export async function openMarketplaceLogSubscription({url,address,WebSocketImpl=
     const params=parsed?.params,result=params?.result;
     if(parsed?.method!=='eth_subscription'||params?.subscription!==subscriptionId||!result||typeof result!=='object')return;
     metrics?.wsNotification?.();
-    // The address filter is repeated locally. All notification content remains
-    // untrusted and is reduced to the removed flag used to trigger a canonical
-    // HTTP checkpoint/reorg check.
     if(typeof result.address==='string'&&result.address.toLowerCase()===address.toLowerCase()){
-      try{onLog({removed:result.removed===true});}catch{}
+      const blockNumber = result.blockNumber ? parseInt(result.blockNumber, 16) : null;
+      try{onLog({removed:result.removed===true, blockNumber});}catch{}
     }
   };
   const onError=()=>finish('WS_SOCKET_ERROR');
