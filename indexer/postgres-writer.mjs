@@ -35,7 +35,7 @@ export class PostgresMarketplaceWriter {
   async checkpoint() {
     let db;
     try { db=await this.pool.connect(); const {rows}=await db.query('SELECT * FROM relic_market_indexer.checkpoints WHERE stream=$1',[this.stream]); return copy(this.check(rows[0])); }
-    catch { throw Error('Unable to read verified indexer checkpoint'); }
+    catch (error) {   const reason =     error?.message === 'Missing checkpoint or manifest mismatch'       ? 'CHECKPOINT_MANIFEST_MISMATCH'       : error?.message === 'Invalid checkpoint version'         ? 'INVALID_CHECKPOINT_VERSION'         : error?.code && /^[0-9A-Z]{5}$/.test(error.code)           ? `POSTGRES_${error.code}`           : 'CHECKPOINT_READ_OR_VALIDATION_FAILED';    throw new Error(     `Unable to read verified indexer checkpoint: ${reason}`   ); }
     finally { db?.release(); }
   }
   async locked(db,version) {
