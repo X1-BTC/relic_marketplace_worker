@@ -147,7 +147,8 @@ export async function verifyChain(client, manifest, blockNumber) {
   if (await client.getChainId() !== 4663) throw Error('RPC is not Robinhood Mainnet 4663');
   for (const key of ['nft','printer','marketplace']) {
     const code=await client.getBytecode({address:addr(m[key]),blockNumber:BigInt(blockNumber)});
-    if (!code || code === '0x' || keccak256(code) !== m.codeHashes[key]) throw Error(`Unauthorized ${key} bytecode`);
+    const actualHash = code && code !== '0x' ? keccak256(code) : 'NO_CODE';  if (actualHash !== m.codeHashes[key]) {   process.stdout.write(JSON.stringify({     event: 'bytecode_diagnostic',     contract: key,     blockNumber,     expectedHash: m.codeHashes[key],     actualHash   }) + '
+');    throw Error(`Unauthorized ${key} bytecode`); }
   }
   const decimals=await client.readContract({address:addr(m.printer),abi:[{type:'function',name:'decimals',stateMutability:'view',inputs:[],outputs:[{type:'uint8'}]}],functionName:'decimals',blockNumber:BigInt(blockNumber)});
   if (decimals !== m.printerDecimals) throw Error('PRINTER decimals do not match the attested manifest');
