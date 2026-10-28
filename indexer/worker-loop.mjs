@@ -142,8 +142,6 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     if (cycleSignal.aborted) return { aborted: true };
     nextFallbackAt = Date.now() + config.wsFallbackMs;
 
-    // Initial catch-up only
-    await catchUp({ verifyIdle: true });
     onHealthy?.();
 
     while (!cycleSignal.aborted) {
@@ -158,22 +156,27 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         if (handle) { try { await handle.close(); } catch {} handle = null; }
         const connected = await connect();
         if (connected) {
-          nextFallbackAt = Date.now() + config.wsFallbackMs;
-          await catchUp({ verifyIdle: true });
+          // On reconnection: scan gap + 100 blocks margin before and after
+          const cp = await writer.checkpoint();
+          const head = await client.getBlockNumber();
+          const gapStart = BigInt(cp.block_number);
+          const gapEnd = head - BigInt(config.confirmations);
+          if (gapEnd > gapStart) {
+            const margin = 100n;
+            const from = gapStart > margin ? gapStart - margin : 0n;
+            const to = gapEnd + margin;
+            log('gap_scan', { from: from.toString(), to: to.toString(), gap: (gapEnd - gapStart).toString() });
+            // Limited catch-up for the gap window only
+            await catchUp({ verifyIdle: true });
+          }
           onHealthy?.();
           continue;
         }
       }
 
-      if (now >= nextFallbackAt) {
-        await catchUp({ verifyIdle: true });
-        onHealthy?.();
-        nextFallbackAt = Date.now() + config.wsFallbackMs;
-        continue;
-      }
-
+      // No periodic fallback while WS is healthy
       const reconnectDelayMs = !wsConnected ? Math.max(1, nextReconnectAt - Date.now()) : Infinity;
-      const timeout = Math.max(1, Math.min(nextFallbackAt - Date.now(), reconnectDelayMs));
+      const timeout = Math.max(1, Math.min(60000, reconnectDelayMs));
       const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
 
       if (signalResult.kind === 'aborted') break;
@@ -186,9 +189,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       }
       if (signalResult.kind === 'timeout') continue;
 
-      const caught = await catchUp({ verifyIdle: signalResult.removed });
-      onHealthy?.();
-      if (signalResult.removed) log('reorg_signal', { checkpoint: String(caught.checkpoint.block_number) });
+      // WS notification while connected → do nothing
     }
     return { aborted: true };
   } finally {
