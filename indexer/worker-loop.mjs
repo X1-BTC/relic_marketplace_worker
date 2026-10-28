@@ -137,44 +137,63 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
 
   // Subscribe first, then read from the durable checkpoint. Signals arriving
   // during catch-up are coalesced and cause another canonical HTTP pass.
-  try{
-  await connect();
-  if(cycleSignal.aborted)return {aborted:true};
-  nextFallbackAt=Date.now()+config.wsFallbackMs;
-  await catchUp({verifyIdle:true});onHealthy?.();
+  try {
+    await connect();
+    if (cycleSignal.aborted) return { aborted: true };
+    nextFallbackAt = Date.now() + config.wsFallbackMs;
 
-  while(!cycleSignal.aborted){
-    const now=Date.now();
-    if(!wsConnected&&disconnectedAt&&now-disconnectedAt>=config.alertStallMs&&!disconnectAlerted){
-      disconnectAlerted=true;log('alert',{code:'WS_DISCONNECTED_TOO_LONG',durationMs:now-disconnectedAt});
-    }
-    if(!wsConnected&&now>=nextReconnectAt){
-      if(handle){try{await handle.close();}catch{}handle=null;}
-      const connected=await connect();
-      if(connected){nextFallbackAt=Date.now()+config.wsFallbackMs;await catchUp({verifyIdle:true});onHealthy?.();continue;}
-    }
-    if(now>=nextFallbackAt){
-      await catchUp({verifyIdle:true});
-      onHealthy?.();
-      nextFallbackAt=Date.now()+config.wsFallbackMs;
-      continue;
-    }
-    const reconnectDelayMs=!wsConnected?Math.max(1,nextReconnectAt-Date.now()):Infinity;
-    const timeout=Math.max(1,Math.min(nextFallbackAt-Date.now(),reconnectDelayMs));
-    const signalResult=await wake.take(timeout,cycleSignal,handle?.closed);
-    if(signalResult.kind==='aborted')break;
-    if(signalResult.kind==='closed'){
-      try{await handle?.close();}catch{}
-      handle=null;wsConnected=false;disconnectedAt??=Date.now();
-      continue;
-    }
-    if(signalResult.kind==='timeout')continue;
-    const caught=await catchUp({verifyIdle:signalResult.removed});
+    // Initial catch-up only
+    await catchUp({ verifyIdle: true });
     onHealthy?.();
-    if(signalResult.removed)log('reorg_signal',{checkpoint:String(caught.checkpoint.block_number)});
+
+    while (!cycleSignal.aborted) {
+      const now = Date.now();
+
+      if (!wsConnected && disconnectedAt && now - disconnectedAt >= config.alertStallMs && !disconnectAlerted) {
+        disconnectAlerted = true;
+        log('alert', { code: 'WS_DISCONNECTED_TOO_LONG', durationMs: now - disconnectedAt });
+      }
+
+      if (!wsConnected && now >= nextReconnectAt) {
+        if (handle) { try { await handle.close(); } catch {} handle = null; }
+        const connected = await connect();
+        if (connected) {
+          nextFallbackAt = Date.now() + config.wsFallbackMs;
+          await catchUp({ verifyIdle: true });
+          onHealthy?.();
+          continue;
+        }
+      }
+
+      if (now >= nextFallbackAt) {
+        await catchUp({ verifyIdle: true });
+        onHealthy?.();
+        nextFallbackAt = Date.now() + config.wsFallbackMs;
+        continue;
+      }
+
+      const reconnectDelayMs = !wsConnected ? Math.max(1, nextReconnectAt - Date.now()) : Infinity;
+      const timeout = Math.max(1, Math.min(nextFallbackAt - Date.now(), reconnectDelayMs));
+      const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
+
+      if (signalResult.kind === 'aborted') break;
+      if (signalResult.kind === 'closed') {
+        try { await handle?.close(); } catch {}
+        handle = null;
+        wsConnected = false;
+        disconnectedAt ??= Date.now();
+        continue;
+      }
+      if (signalResult.kind === 'timeout') continue;
+
+      const caught = await catchUp({ verifyIdle: signalResult.removed });
+      onHealthy?.();
+      if (signalResult.removed) log('reorg_signal', { checkpoint: String(caught.checkpoint.block_number) });
+    }
+    return { aborted: true };
+  } finally {
+    try { await handle?.close(); } catch {}
   }
-  return {aborted:true};
-  }finally{try{await handle?.close();}catch{}}
 }
 
 export async function runWorker({config,pool,makeClient,signal,log,onSession,openSubscription=openMarketplaceLogSubscription,metrics,writerFactory=options=>new PostgresMarketplaceWriter(options),onCycleError}) {
