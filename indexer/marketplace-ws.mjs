@@ -51,7 +51,8 @@ export async function openMarketplaceLogSubscription({url,address,WebSocketImpl=
     let parsed;
     try{parsed=JSON.parse(await messageText(event.data));}catch{return;}
     if(parsed?.id===SUBSCRIBE_ID){
-      if(parsed.error||typeof parsed.result!=='string'||!/^0x[0-9a-fA-F]{64}$/.test(parsed.result)){finish('WS_SUBSCRIBE_REJECTED');return;}
+      // Alchemy may return subscription IDs shorter than 32 bytes.
+      if(parsed.error||typeof parsed.result!=='string'||!/^0x[0-9a-fA-F]+$/.test(parsed.result)){finish('WS_SUBSCRIBE_REJECTED');return;}
       subscriptionId=parsed.result;settled=true;
       try{onState('connected');}catch{}
       resolveReady(handle);return;
