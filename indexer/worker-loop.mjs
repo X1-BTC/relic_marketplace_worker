@@ -135,6 +135,8 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     return {checkpoint:cp,head,lag,batches};
   };
 
+  // Subscribe first, then read from the durable checkpoint. Signals arriving
+  // during catch-up are coalesced and cause another canonical HTTP pass.
   try{
   await connect();
   if(cycleSignal.aborted)return {aborted:true};
@@ -195,9 +197,4 @@ export async function runWorker({config,pool,makeClient,signal,log,onSession,ope
       if(bytecodeMismatch(error)){log('fatal',{code:'CONTRACT_BYTECODE_MISMATCH'});throw new WorkerFault('CONTRACT_BYTECODE_MISMATCH',{fatal:true});}
       failures++;
       const wait=jitter(Math.min(config.retryMaxMs,config.retryMinMs*2**Math.min(failures-1,10)));
-      log('retry',{attempt:failures,delayMs:wait,code:workerCode(error)});
-      session?.close();onSession(null);
-      await sleep(wait,signal);
-    }finally{session?.close();onSession(null);}
-  }
-}
+      log('retry',{attempt:failures,delayMs:wait,code:workerCode
