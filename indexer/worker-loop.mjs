@@ -197,4 +197,9 @@ export async function runWorker({config,pool,makeClient,signal,log,onSession,ope
       if(bytecodeMismatch(error)){log('fatal',{code:'CONTRACT_BYTECODE_MISMATCH'});throw new WorkerFault('CONTRACT_BYTECODE_MISMATCH',{fatal:true});}
       failures++;
       const wait=jitter(Math.min(config.retryMaxMs,config.retryMinMs*2**Math.min(failures-1,10)));
-      log('retry',{attempt:failures,delayMs:wait,code:workerCode
+      log('retry',{attempt:failures,delayMs:wait,code:workerCode(error)});
+      session?.close();onSession(null);
+      await sleep(wait,signal);
+    }finally{session?.close();onSession(null);}
+  }
+}
