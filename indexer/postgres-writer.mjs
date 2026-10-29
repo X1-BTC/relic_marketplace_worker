@@ -284,4 +284,7 @@ export class PostgresMarketplaceWriter {
       const state=await this.readEntitySeeds(db,refs);
       const advanced=await db.query('UPDATE relic_market_indexer.checkpoints SET block_number=$2,block_hash=$3,version=version+1 WHERE stream=$1 AND version=$4 RETURNING version',[this.stream,ancestor.block_number,ancestor.block_hash,cp.version]);
       if(advanced.rows.length!==1)throw Error('Checkpoint recovery compare-and-advance failed');
-      return
+      return {blockNumber:Number(ancestor.block_number),blockHash:ancestor.block_hash,version:nextVersion,state};
+    });
+  }
+}
