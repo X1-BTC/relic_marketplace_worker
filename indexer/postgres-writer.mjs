@@ -38,6 +38,22 @@ export class PostgresMarketplaceWriter {
     catch (error) {   const reason =     error?.message === 'Missing checkpoint or manifest mismatch'       ? 'CHECKPOINT_MANIFEST_MISMATCH'       : error?.message === 'Invalid checkpoint version'         ? 'INVALID_CHECKPOINT_VERSION'         : error?.code && /^[0-9A-Z]{5}$/.test(error.code)           ? `POSTGRES_${error.code}`           : 'CHECKPOINT_READ_OR_VALIDATION_FAILED';    throw new Error(     `Unable to read verified indexer checkpoint: ${reason}`   ); }
     finally { db?.release(); }
   }
+  async advanceCheckpoint({ blockNumber, blockHash, expectedVersion }) {
+    return this.transaction(async db => {
+      const cp = await this.locked(db, expectedVersion);
+      if (Number(cp.block_number) >= blockNumber) return { unchanged: true };
+      const nextVersion = (BigInt(cp.version) + 1n).toString();
+      const advanced = await db.query(
+        `UPDATE relic_market_indexer.checkpoints 
+         SET block_number = $2, block_hash = $3, version = version + 1 
+         WHERE stream = $1 AND version = $4 
+         RETURNING version`,
+        [this.stream, blockNumber, blockHash, cp.version]
+      );
+      if (advanced.rows.length !== 1) throw Error('Checkpoint advance compare-and-swap failed');
+      return { blockNumber, blockHash, version: nextVersion };
+    });
+  }
   async locked(db,version) {
     const {rows}=await db.query('SELECT * FROM relic_market_indexer.checkpoints WHERE stream=$1 FOR UPDATE',[this.stream]);
     const cp=this.check(rows[0]);
@@ -171,115 +187,4 @@ export class PostgresMarketplaceWriter {
       VALUES($1,4663,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(stream) DO UPDATE SET checkpoint_version=EXCLUDED.checkpoint_version,
         checkpoint_block_number=EXCLUDED.checkpoint_block_number,checkpoint_block_hash=EXCLUDED.checkpoint_block_hash,updated_at=now()
-      WHERE relic_market_indexer.wallet_volume_state.chain_id=4663
-        AND relic_market_indexer.wallet_volume_state.marketplace_address=EXCLUDED.marketplace_address
-        AND relic_market_indexer.wallet_volume_state.currency_address=EXCLUDED.currency_address
-        AND relic_market_indexer.wallet_volume_state.currency_decimals=EXCLUDED.currency_decimals
-      RETURNING stream`,[this.stream,this.manifest.marketplace.toLowerCase(),this.manifest.printer.toLowerCase(),this.manifest.printerDecimals,version,blockNumber,blockHash]);
-    if(rows.length!==1) throw Error('Volume checkpoint configuration mismatch');
-  }
-  async ingest(db,e) {
-    const row=rawRow(e,this.manifest); const columns=Object.keys(row);
-    const inserted=await db.query(`INSERT INTO public.relic_market_raw_events(${columns.join(',')}) VALUES(${columns.map((_,i)=>'$'+(i+1)).join(',')}) ON CONFLICT(chain_id,transaction_hash,log_index) DO NOTHING RETURNING chain_id`,columns.map(c=>row[c]));
-    if(!inserted.rows.length) {
-      const prior=await db.query('SELECT r.*,j.stream AS owner_stream FROM public.relic_market_raw_events r LEFT JOIN relic_market_indexer.events j ON j.chain_id=r.chain_id AND j.transaction_hash=r.transaction_hash AND j.log_index=r.log_index WHERE r.chain_id=4663 AND r.transaction_hash=$1 AND r.log_index=$2',[e.transactionHash,e.logIndex]);
-      const old=prior.rows[0];
-      if(!old || old.owner_stream!==this.stream || old.ingest_source!=='LIVE' || json(rawPayload(old))!==json(e)) throw Error('Protected/unowned/conflicting raw event');
-    }
-    await db.query('INSERT INTO relic_market_indexer.events(stream,transaction_hash,log_index,block_number) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[this.stream,e.transactionHash,e.logIndex,e.blockNumber]);
-  }
-  async commit(batch) {
-    // Defensive copy before waiting for the lock; callers cannot mutate a queued batch.
-    const input=copy(batch);
-    return this.transaction(async db=>{
-      const cp=await this.locked(db,input.expectedVersion);
-      let number=Number(cp.block_number), parent=cp.block_hash;
-      if(number<SNAPSHOT_BLOCK) throw Error('Checkpoint precedes protected snapshot');
-      await this.registry(db,number+1);
-      if (!input.blocks?.length || input.blocks.length > 1000) throw Error('Invalid block batch');
-      const hashes=new Map();
-      for (const b of input.blocks) {
-        integer(b.number); hash(b.hash); hash(b.parentHash);
-        if (b.number !== number+1 || b.parentHash !== parent) throw Error('Reorg/gap: recover before advancing');
-        number=b.number; parent=b.hash; hashes.set(number,parent);
-        await db.query('INSERT INTO relic_market_indexer.blocks(stream,block_number,block_hash,parent_hash) VALUES($1,$2,$3,$4)',[this.stream,number,parent,b.parentHash]);
-      }
-      const unique=new Map(); const positions=new Set();
-      for (const raw of input.events) {
-        const e=normalizeLog(raw); const key=eventKey(e);
-        if (hashes.get(e.blockNumber) !== e.blockHash) throw Error('Event outside canonical batch');
-        if (unique.has(key)) { if (json(unique.get(key)) !== json(e)) throw Error('Conflicting duplicate'); continue; }
-        const position=`${e.blockNumber}:${e.logIndex}`;
-        if (positions.has(position)) throw Error('Conflicting block log position'); positions.add(position);
-        unique.set(key,e);
-      }
-      const ordered=[...unique.values()].sort((a,b)=>a.blockNumber-b.blockNumber||a.logIndex-b.logIndex);
-      const eventsByBlock=new Map();
-      for(const event of ordered){
-        const bucket=eventsByBlock.get(event.blockNumber);
-        if(bucket)bucket.push(event);else eventsByBlock.set(event.blockNumber,[event]);
-      }
-      const nextVersion=(BigInt(cp.version)+1n).toString();
-      await this.setVolumeCheckpoint(db,nextVersion,number,parent);
-      const state={listings:{},offers:{},sales:{},transfers:{}};
-      for(const block of input.blocks){
-        const events=eventsByBlock.get(block.number)??[];
-        for(const e of events)await this.ingest(db,e);
-        if(!events.length)continue;
-        const refs=entityReferences(events,this.manifest);
-        const seed=await this.captureEntityUndo(db,block.number,refs);
-        let projected,rows;
-        try{projected=project(events,this.manifest,seed);}catch(error){error.indexerReason=`Projection stage: ${String(error.message).slice(0,120)}`;throw error;}
-        try{rows=businessRows(events,projected,this.manifest,this.stream);}catch(error){error.indexerReason=`Business mapping stage: ${String(error.message).slice(0,120)}`;throw error;}
-        for(const table of ['relic_market_activity','relic_market_config_events','relic_market_listings','relic_market_offers','relic_market_settlements','relic_market_payment_transfers'])
-          for(const row of rows[table])await upsertBusinessRow(db,table,row,this.stream);
-        for(const key of ['listings','offers','sales','transfers'])Object.assign(state[key],projected[key]);
-      }
-      const advanced=await db.query('UPDATE relic_market_indexer.checkpoints SET block_number=$2,block_hash=$3,version=version+1 WHERE stream=$1 AND version=$4 RETURNING version',[this.stream,number,parent,cp.version]);
-      if(advanced.rows.length!==1)throw Error('Checkpoint compare-and-advance failed');
-      return {blockNumber:number,blockHash:parent,version:nextVersion,state};
-    });
-  }
-  async recover({client,expectedVersion}) {
-    return this.transaction(async db=>{
-      const cp=await this.locked(db,expectedVersion);
-      await verifyChain(client,this.manifest,Number(cp.block_number));
-      const {rows}=await db.query('SELECT block_number,block_hash FROM relic_market_indexer.blocks WHERE stream=$1 ORDER BY block_number DESC',[this.stream]);
-      let ancestor=null;
-      for (const b of [...rows,{block_number:cp.anchor_number,block_hash:cp.anchor_hash}]) {
-        const canonical=await client.getBlock({blockNumber:BigInt(b.block_number)});
-        if (canonical.hash === b.block_hash) { ancestor=b; break; }
-      }
-      if (!ancestor) throw Error('Reorg below anchor: reviewed replacement required');
-      // Check the selected ancestor again before deleting any orphaned data.
-      if ((await client.getBlock({blockNumber:BigInt(ancestor.block_number)})).hash !== ancestor.block_hash) throw Error('Unstable recovery ancestor');
-      if (String(ancestor.block_number) === String(cp.block_number) && ancestor.block_hash === cp.block_hash) return {unchanged:true};
-      if(Number(ancestor.block_number)<SNAPSHOT_BLOCK) throw Error('Protected snapshot recovery');
-      await this.registry(db,Number(ancestor.block_number)+1);
-      const orphans=await this.journal(db,ancestor.block_number);
-      const nextVersion=(BigInt(cp.version)+1n).toString();
-      await this.setVolumeCheckpoint(db,nextVersion,Number(ancestor.block_number),ancestor.block_hash);
-      // Exact journal-owned keys only. Never delete a range from public tables.
-      // All payment children are removed before any settlement parent.
-      const refs=entityReferences(orphans,this.manifest);
-      await this.restoreEntityUndo(db,ancestor.block_number);
-      for(const e of orphans) await db.query('DELETE FROM public.relic_market_payment_transfers WHERE chain_id=4663 AND transaction_hash=$1 AND log_index=$2',[e.transactionHash,e.logIndex]);
-      for(const e of orphans) {
-        for(const table of ['relic_market_settlements','relic_market_config_events']) {
-          const log=table==='relic_market_settlements'?'sale_log_index':'log_index';
-          await db.query(`DELETE FROM public.${table} WHERE chain_id=4663 AND marketplace_address=$1 AND transaction_hash=$2 AND ${log}=$3`,[this.manifest.marketplace.toLowerCase(),e.transactionHash,e.logIndex]);
-        }
-        await db.query('DELETE FROM public.relic_market_activity WHERE chain_id=4663 AND marketplace_address=$1 AND transaction_hash=$2 AND log_index=$3 AND event_ordinal=0 AND ingest_source=\'LIVE\' AND details->>\'indexer_stream\'=$4',[this.manifest.marketplace.toLowerCase(),e.transactionHash,e.logIndex,this.stream]);
-      }
-      for(const e of orphans) {
-        const deleted=await db.query('DELETE FROM public.relic_market_raw_events WHERE chain_id=4663 AND transaction_hash=$1 AND log_index=$2 AND block_hash=$3 AND ingest_source=\'LIVE\' RETURNING chain_id',[e.transactionHash,e.logIndex,e.blockHash]);
-        if(deleted.rows.length!==1) throw Error('Orphan ownership changed');
-      }
-      await db.query('DELETE FROM relic_market_indexer.blocks WHERE stream=$1 AND block_number>$2',[this.stream,ancestor.block_number]);
-      const state=await this.readEntitySeeds(db,refs);
-      const advanced=await db.query('UPDATE relic_market_indexer.checkpoints SET block_number=$2,block_hash=$3,version=version+1 WHERE stream=$1 AND version=$4 RETURNING version',[this.stream,ancestor.block_number,ancestor.block_hash,cp.version]);
-      if(advanced.rows.length!==1)throw Error('Checkpoint recovery compare-and-advance failed');
-      return {blockNumber:Number(ancestor.block_number),blockHash:ancestor.block_hash,version:nextVersion,state};
-    });
-  }
-}
+      WHERE relic_market_indexer.wallet_volume_state.chain_id=466
