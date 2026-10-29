@@ -1,8 +1,6 @@
 import {copy,json,validateManifest,manifestDigest,normalizeLog,eventKey,project,hash,integer,verifyChain} from './marketplace.mjs';
 import {SNAPSHOT_BLOCK, rawPayload, rawRow, businessRows, entityReferences, upsertBusinessRow} from './business-tables.mjs';
 
-// pg-compatible Pool dependency injection. No default URL or environment access.
-// Only an explicitly supplied pool can write; application /api/data stays read-only.
 export class PostgresMarketplaceWriter {
   constructor({pool,stream,manifest}) {
     this.pool=pool;
@@ -26,16 +24,21 @@ export class PostgresMarketplaceWriter {
       const result=await work(db);
       await db.query('COMMIT'); return result;
     } catch (error) {
-      if (begun) { try { await db.query('ROLLBACK'); } catch { /* release destroys unusable connection below */ } }
-      // Never include connection strings, SQL parameter values, or driver errors.
+      if (begun) { try { await db.query('ROLLBACK'); } catch {} }
       const safeCode=/^[0-9A-Z]{5}$/.test(String(error.code??''))?`Database SQLSTATE ${error.code}`:'Database or projection failure';
       throw new Error('Indexer transaction failed; reread checkpoint before retry', {cause: new Error(error.indexerReason ?? safeCode)});
-    } finally { db?.release(true); } // discard also after uncertain COMMIT / rollback failure
+    } finally { db?.release(true); }
   }
   async checkpoint() {
     let db;
     try { db=await this.pool.connect(); const {rows}=await db.query('SELECT * FROM relic_market_indexer.checkpoints WHERE stream=$1',[this.stream]); return copy(this.check(rows[0])); }
-    catch (error) {   const reason =     error?.message === 'Missing checkpoint or manifest mismatch'       ? 'CHECKPOINT_MANIFEST_MISMATCH'       : error?.message === 'Invalid checkpoint version'         ? 'INVALID_CHECKPOINT_VERSION'         : error?.code && /^[0-9A-Z]{5}$/.test(error.code)           ? `POSTGRES_${error.code}`           : 'CHECKPOINT_READ_OR_VALIDATION_FAILED';    throw new Error(     `Unable to read verified indexer checkpoint: ${reason}`   ); }
+    catch (error) {
+      const reason = error?.message === 'Missing checkpoint or manifest mismatch' ? 'CHECKPOINT_MANIFEST_MISMATCH'
+        : error?.message === 'Invalid checkpoint version' ? 'INVALID_CHECKPOINT_VERSION'
+        : error?.code && /^[0-9A-Z]{5}$/.test(error.code) ? `POSTGRES_${error.code}`
+        : 'CHECKPOINT_READ_OR_VALIDATION_FAILED';
+      throw new Error(`Unable to read verified indexer checkpoint: ${reason}`);
+    }
     finally { db?.release(); }
   }
   async advanceCheckpoint({ blockNumber, blockHash, expectedVersion }) {
@@ -44,10 +47,7 @@ export class PostgresMarketplaceWriter {
       if (Number(cp.block_number) >= blockNumber) return { unchanged: true };
       const nextVersion = (BigInt(cp.version) + 1n).toString();
       const advanced = await db.query(
-        `UPDATE relic_market_indexer.checkpoints 
-         SET block_number = $2, block_hash = $3, version = version + 1 
-         WHERE stream = $1 AND version = $4 
-         RETURNING version`,
+        `UPDATE relic_market_indexer.checkpoints SET block_number=$2, block_hash=$3, version=version+1 WHERE stream=$1 AND version=$4 RETURNING version`,
         [this.stream, blockNumber, blockHash, cp.version]
       );
       if (advanced.rows.length !== 1) throw Error('Checkpoint advance compare-and-swap failed');
@@ -70,22 +70,15 @@ export class PostgresMarketplaceWriter {
     }
   }
   async journal(db, afterBlock=null) {
-    // Used only for explicit reconstruction or the exact orphan range during a
-    // reorg. The normal commit path never calls this full-journal reader.
     const {rows}=await db.query('SELECT r.*,j.block_number AS journal_block_number,b.block_hash AS journal_block_hash FROM relic_market_indexer.events j JOIN relic_market_indexer.blocks b ON b.stream=j.stream AND b.block_number=j.block_number JOIN public.relic_market_raw_events r ON r.chain_id=j.chain_id AND r.transaction_hash=j.transaction_hash AND r.log_index=j.log_index WHERE j.stream=$1 AND ($2::bigint IS NULL OR j.block_number>$2) ORDER BY j.block_number,j.log_index',[this.stream,afterBlock]);
     if(rows.some(r=>r.ingest_source!=='LIVE' || r.removed || String(r.block_number)!==String(r.journal_block_number) || r.block_hash!==r.journal_block_hash)) throw Error('Protected or removed journal event');
     return rows.map(rawPayload);
   }
   async rebuildFromJournal(db, { confirmation } = {}) {
-    // Deliberate maintenance operation only. It is never called by commit()
-    // or recover(); normal projection and rollback are incremental.
-    if (confirmation !== 'REBUILD_MARKETPLACE_PROJECTIONS') {
-      throw Error('Explicit Marketplace projection rebuild confirmation required');
-    }
+    if (confirmation !== 'REBUILD_MARKETPLACE_PROJECTIONS') throw Error('Explicit Marketplace projection rebuild confirmation required');
     const events=await this.journal(db);
     const state=project(events,this.manifest);
     const rows=businessRows(events,state,this.manifest,this.stream);
-    // Deferrable payment FK is also respected by writing settlements first.
     for(const table of ['relic_market_activity','relic_market_config_events','relic_market_listings','relic_market_offers','relic_market_settlements','relic_market_payment_transfers']) {
       for(const row of rows[table]) await upsertBusinessRow(db,table,row,this.stream);
     }
@@ -205,7 +198,6 @@ export class PostgresMarketplaceWriter {
     await db.query('INSERT INTO relic_market_indexer.events(stream,transaction_hash,log_index,block_number) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[this.stream,e.transactionHash,e.logIndex,e.blockNumber]);
   }
   async commit(batch) {
-    // Defensive copy before waiting for the lock; callers cannot mutate a queued batch.
     const input=copy(batch);
     return this.transaction(async db=>{
       const cp=await this.locked(db,input.expectedVersion);
@@ -267,7 +259,6 @@ export class PostgresMarketplaceWriter {
         if (canonical.hash === b.block_hash) { ancestor=b; break; }
       }
       if (!ancestor) throw Error('Reorg below anchor: reviewed replacement required');
-      // Check the selected ancestor again before deleting any orphaned data.
       if ((await client.getBlock({blockNumber:BigInt(ancestor.block_number)})).hash !== ancestor.block_hash) throw Error('Unstable recovery ancestor');
       if (String(ancestor.block_number) === String(cp.block_number) && ancestor.block_hash === cp.block_hash) return {unchanged:true};
       if(Number(ancestor.block_number)<SNAPSHOT_BLOCK) throw Error('Protected snapshot recovery');
@@ -275,8 +266,6 @@ export class PostgresMarketplaceWriter {
       const orphans=await this.journal(db,ancestor.block_number);
       const nextVersion=(BigInt(cp.version)+1n).toString();
       await this.setVolumeCheckpoint(db,nextVersion,Number(ancestor.block_number),ancestor.block_hash);
-      // Exact journal-owned keys only. Never delete a range from public tables.
-      // All payment children are removed before any settlement parent.
       const refs=entityReferences(orphans,this.manifest);
       await this.restoreEntityUndo(db,ancestor.block_number);
       for(const e of orphans) await db.query('DELETE FROM public.relic_market_payment_transfers WHERE chain_id=4663 AND transaction_hash=$1 AND log_index=$2',[e.transactionHash,e.logIndex]);
@@ -295,7 +284,4 @@ export class PostgresMarketplaceWriter {
       const state=await this.readEntitySeeds(db,refs);
       const advanced=await db.query('UPDATE relic_market_indexer.checkpoints SET block_number=$2,block_hash=$3,version=version+1 WHERE stream=$1 AND version=$4 RETURNING version',[this.stream,ancestor.block_number,ancestor.block_hash,cp.version]);
       if(advanced.rows.length!==1)throw Error('Checkpoint recovery compare-and-advance failed');
-      return {blockNumber:Number(ancestor.block_number),blockHash:ancestor.block_hash,version:nextVersion,state};
-    });
-  }
-}
+      return
