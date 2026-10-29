@@ -1,4 +1,4 @@
-# Relic Marketplace Worker — Railway package
+# Relic Marketplace Worker 
 
 Minimal standalone runtime package. Railway uses Node.js 24, installs with `npm ci --omit=dev --ignore-scripts --no-audit --no-fund`, checks with `npm run check:marketplace-worker`, and starts with `node --max-old-space-size=192 indexer/worker.mjs`. Locally, `npm start` runs the same command.
 
