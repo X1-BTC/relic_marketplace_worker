@@ -100,7 +100,10 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
             await writer.commit({ blockNumber: Number(confirmed), blockHash: '0x', version: Number(cp.version) + 1, logs: [] });
             log('checkpoint_advanced', { block: confirmed.toString() });
           }
-        } catch {}
+        } catch (err) {
+          console.error('[CHECKPOINT_COMMIT_FAILED]', err?.message || err);
+          log('alert', { code: 'CHECKPOINT_COMMIT_FAILED' });
+        }
         nextCheckpointUpdate = now + 180000;
       }
 
@@ -110,7 +113,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       }
 
       if (!wsConnected && now >= nextReconnectAt) {
-        if (handle) { try { await handle.close(); } catch {} handle = null; }
+        if (handle) { try { await handle.close(); } catch (err) { console.error('[HANDLE_CLOSE_FAILED]', err?.message || err); } handle = null; }
         const connected = await connect();
         if (connected) {
           // On reconnect: scan from checkpoint to current confirmed + margin
@@ -122,7 +125,10 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
               log('reconnect_scan', { from: cp.block_number, to: target.toString() });
               await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: 200, checkpoint: cp, head, verifyIdle: true });
             }
-          } catch {}
+          } catch (err) {
+            console.error('[RECONNECT_SCAN_FAILED]', err?.message || err);
+            log('alert', { code: 'RECONNECT_SCAN_FAILED' });
+          }
           onHealthy?.();
           continue;
         }
@@ -134,7 +140,10 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
           const cp = await writer.checkpoint();
           const head = await client.getBlockNumber();
           await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: 10, checkpoint: cp, head, verifyIdle: false });
-        } catch {}
+        } catch (err) {
+          console.error('[DISCONNECTED_CATCHUP_FAILED]', err?.message || err);
+          log('alert', { code: 'DISCONNECTED_CATCHUP_FAILED' });
+        }
         await sleep(2000, cycleSignal);
         continue;
       }
@@ -144,7 +153,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
 
       if (signalResult.kind === 'aborted') break;
       if (signalResult.kind === 'closed') {
-        try { await handle?.close(); } catch {}
+        try { await handle?.close(); } catch (err) { console.error('[HANDLE_CLOSE_FAILED]', err?.message || err); }
         handle = null;
         wsConnected = false;
         disconnectedAt ??= Date.now();
@@ -166,13 +175,16 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
             verifyIdle: false,
           });
           log('event_processed', { block: signalResult.blockNumber });
-        } catch {}
+        } catch (err) {
+          console.error('[EVENT_PROCESS_FAILED]', err?.message || err);
+          log('alert', { code: 'EVENT_PROCESS_FAILED' });
+        }
       }
       onHealthy?.();
     }
     return { aborted: true };
   } finally {
-    try { await handle?.close(); } catch {}
+    try { await handle?.close(); } catch (err) { console.error('[HANDLE_CLOSE_FAILED]', err?.message || err); }
   }
 }
 
@@ -191,7 +203,7 @@ export async function runWorker({config,pool,makeClient,signal,log,onSession,ope
       if(!signal.aborted)throw new WorkerFault('DATABASE_SESSION_LOST');
     }catch(error){
       if(signal.aborted)break;
-      try{onCycleError?.(error);}catch{}
+      try{onCycleError?.(error);}catch(err){ console.error('[ON_CYCLE_ERROR_FAILED]', err?.message || err); }
       if(error instanceof WorkerFault&&error.fatal){log('fatal',{code:error.code});throw error;}
       if(bytecodeMismatch(error)){log('fatal',{code:'CONTRACT_BYTECODE_MISMATCH'});throw new WorkerFault('CONTRACT_BYTECODE_MISMATCH',{fatal:true});}
       failures++;
