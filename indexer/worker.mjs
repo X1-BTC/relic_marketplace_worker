@@ -13,6 +13,7 @@ const events=new Set([
   'retry','recovered','fatal','stopping','stopped',
   'shutdown_deadline','ws_connected','ws_disconnected',
   'ws_reconnect_failed','reorg_signal','rpc_metrics','alert',
+  'worker_status',
   // Ajouts pour les logs d’activité actuels
   'checkpoint_advanced','reconnect_scan','event_processed','event_pending_confirmation'
 ]);
@@ -23,6 +24,7 @@ const fields=new Set([
   'wsMessagesIn','wsNotifications','eth_blockNumber','eth_chainId',
   'eth_getBlockByNumber','eth_getTransactionReceipt',
   'eth_getCode','eth_call',
+  'state','component','reason',
   // Ajouts pour les nouveaux événements
   'block','from','to'
 ]);
@@ -67,7 +69,8 @@ try {
       transport:viem.http(config.httpRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:createCountingFetch(metrics),fetchOptions:{signal}}),
       cacheTime:0,
     }),config.manifest,metrics);
-    const makeLogSource=signal=>new HyperSyncLogSource({apiToken:config.envioApiToken,signal});
+    const makeLogSource=signal=>new HyperSyncLogSource({apiToken:config.envioApiToken,signal,
+      onReady:()=>log('worker_status',{state:'ENVIO_READY',component:'ENVIO'})});
     log('starting');
     await runWorker({config,pool,makeClient,makeLogSource,signal:stop.signal,log,onSession:value=>{session=value;},metrics});
   }

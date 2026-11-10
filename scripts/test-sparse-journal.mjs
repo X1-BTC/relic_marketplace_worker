@@ -43,7 +43,8 @@ function rpc({logs=[],orphan=false}={}){
   const rawLog=n=>({address:manifest.marketplace.toLowerCase(),block_number:n,block_hash:H(n),transaction_hash:H(n+5000),transaction_index:0,log_index:0,
     topic0:marketEvents.getEvent('PlatformFeeInfoUpdated').topicHash,topic1:H(1),data:'0x',removed:false});
   const rawBlock=n=>({number:n,hash:H(n),parent_hash:H(n-1)});
-  const source=new HyperSyncLogSource({apiToken:'test-token',fetchImpl:async(url,options)=>{
+  let readySignals=0;
+  const source=new HyperSyncLogSource({apiToken:'test-token',onReady:()=>readySignals++,fetchImpl:async(url,options)=>{
     const body=JSON.parse(options.body);bodies.push(body);page++;
     const response=page===1?{data:[{logs:[rawLog(100)],blocks:[rawBlock(100),rawBlock(101)]}],next_block:102,rollback_guard:{block_number:101,hash:H(101),first_block_number:100,first_parent_hash:H(99)}}:
       {data:[{logs:[rawLog(102),rawLog(103)],blocks:[rawBlock(102),rawBlock(103)]}],next_block:104,rollback_guard:{block_number:103,hash:H(103),first_block_number:102,first_parent_hash:H(101)}};
@@ -60,6 +61,7 @@ function rpc({logs=[],orphan=false}={}){
   assert.deepEqual(bodies[0].field_selection.block,['number','hash','parent_hash']);
   assert.ok(bodies[0].field_selection.log.includes('transaction_index'));
   assert.ok(bodies[0].field_selection.log.includes('block_hash'));
+  assert.equal(readySignals,1,'ENVIO_READY can only follow one complete validated response');
 }
 {
   const source=new HyperSyncLogSource({apiToken:'test-token',fetchImpl:async()=>({ok:true,json:async()=>({data:[{blocks:[{number:500,hash:H(500),parent_hash:H(499)}]}],next_block:501,rollback_guard:null})})});

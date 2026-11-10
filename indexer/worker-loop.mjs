@@ -51,6 +51,7 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
   const indexBatch=async options=>{
     const verifyContracts=!integrityVerified;
     const result=await indexOnce({...options,logSource,verifyContracts,verifyIdle:verifyContracts});
+    if(result?.blockNumber!==undefined)log('worker_status',{state:'CHECKPOINT_ADVANCED',checkpoint:String(result.blockNumber),version:String(result.version)});
     if(verifyContracts)integrityVerified=true;
     return result;
   };
@@ -72,6 +73,8 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
   };
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
   let reconnectFailures=0,nextReconnectAt=0,nextCatchupAt=0,nextConfirmAt=0,pendingEventBlock=0;
+  const metricsTimer=metrics?.snapshot?setInterval(()=>log('rpc_metrics',metrics.snapshot({reset:true})),60000):null;
+  metricsTimer?.unref?.();
   const connect=async()=>{
     try{
       handle=await openSubscription({
@@ -85,6 +88,8 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
               wsConnected=false;disconnectedAt??=Date.now();reconnectFailures++;
               const wait=retryDelay(config,reconnectFailures);nextReconnectAt=Date.now()+wait;
               log('ws_disconnected',{attempt:reconnectFailures,delayMs:wait});
+              log('worker_status',{state:'WS_DISCONNECTED',component:'ALCHEMY_WS'});
+              log('worker_status',{state:'RETRYING',component:'ALCHEMY_WS',delayMs:wait});
               if(reconnectFailures>=3)log('alert',{code:'WS_RECONNECTS_REPEATED',attempt:reconnectFailures});
             }
             if(wasConnected)wake.push();
@@ -93,12 +98,15 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
       });
       reconnectFailures=0;nextReconnectAt=0;
       log('ws_connected');
+      log('worker_status',{state:'WS_CONNECTED',component:'ALCHEMY_WS'});
       return true;
     }catch(error){
       if(cycleSignal.aborted)return false;
       handle=null;wsConnected=false;disconnectedAt??=Date.now();reconnectFailures++;
       const wait=retryDelay(config,reconnectFailures);nextReconnectAt=Date.now()+wait;
       log('ws_reconnect_failed',{attempt:reconnectFailures,delayMs:wait,code:workerCode(error)});
+      log('worker_status',{state:'WS_DISCONNECTED',component:'ALCHEMY_WS',reason:workerCode(error)});
+      log('worker_status',{state:'RETRYING',component:'ALCHEMY_WS',delayMs:wait,attempt:reconnectFailures});
       if(reconnectFailures>=3)log('alert',{code:'WS_RECONNECTS_REPEATED',attempt:reconnectFailures});
       return false;
     }
@@ -134,6 +142,8 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
           onHealthy?.();
         } catch (err) {
           catchupFailed=true;
+          const envioFailure=typeof err?.code==='string'&&err.code.startsWith('HYPERSYNC_');
+          log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':'INDEXER',reason:envioFailure?err.code:workerCode(err),delayMs:15000});
           try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
           console.error('[CATCHUP_FAILED]', err?.message || err);
           log('alert', { code: 'CATCHUP_FAILED' });
@@ -156,6 +166,8 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
             log('reconnect_scan', { from: cp.block_number, to: 'confirmed_head' });
             await catchUp();
           } catch (err) {
+            const envioFailure=typeof err?.code==='string'&&err.code.startsWith('HYPERSYNC_');
+            log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':'INDEXER',reason:envioFailure?err.code:workerCode(err),delayMs:15000});
             try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
             nextCatchupAt=Date.now()+15000;
             console.error('[RECONNECT_SCAN_FAILED]', err?.message || err);
@@ -199,6 +211,8 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
           if(Number(latest.block_number)>=pendingEventBlock){pendingEventBlock=0;nextConfirmAt=0;log('event_processed', { block: signalResult.blockNumber });}
           else {nextConfirmAt=Date.now()+Math.max(5000,config.confirmations*1000);log('event_pending_confirmation',{block:signalResult.blockNumber});}
         } catch (err) {
+          const envioFailure=typeof err?.code==='string'&&err.code.startsWith('HYPERSYNC_');
+          log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':'INDEXER',reason:envioFailure?err.code:workerCode(err),delayMs:15000});
           try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
           nextCatchupAt=Date.now()+15000;
           console.error('[EVENT_PROCESS_FAILED]', err?.message || err);
@@ -209,6 +223,7 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
     }
     return { aborted: true };
   } finally {
+    if(metricsTimer)clearInterval(metricsTimer);
     try { await handle?.close(); } catch (err) { console.error('[HANDLE_CLOSE_FAILED]', err?.message || err); }
   }
 }
@@ -220,10 +235,12 @@ export async function runWorker({config,pool,makeClient,makeLogSource,signal,log
     try{
       session=await acquireWorkerSession(pool,{login:config.login,database:config.connection.database,signal});
       if(!session){
-        if(!signal.aborted&&!standbyLogged){log('standby');standbyLogged=true;}
+        if(!signal.aborted&&!standbyLogged){log('standby');log('worker_status',{state:'STANDBY',component:'DATABASE_LOCK',reason:'ADVISORY_LOCK_HELD'});standbyLogged=true;}
+        if(!signal.aborted)log('worker_status',{state:'RETRYING',component:'DATABASE_LOCK',delayMs:config.pollMs});
         await sleep(jitter(config.pollMs),signal);continue;
       }
       standbyLogged=false;onSession(session);log('leader',{serverVersion:session.version});
+      log('worker_status',{state:'LEADER',component:'DATABASE_LOCK'});
       await runLeader({config,session,pool,makeClient,makeLogSource,signal,log,openSubscription,metrics,writerFactory,onHealthy:()=>{failures=0;}});
       if(!signal.aborted)throw new WorkerFault('DATABASE_SESSION_LOST');
     }catch(error){
@@ -234,6 +251,7 @@ export async function runWorker({config,pool,makeClient,makeLogSource,signal,log
       failures++;
       const wait=jitter(Math.min(config.retryMaxMs,config.retryMinMs*2**Math.min(failures-1,10)));
       log('retry',{attempt:failures,delayMs:wait,code:workerCode(error)});
+      log('worker_status',{state:'RETRYING',component:'WORKER',reason:workerCode(error),delayMs:wait,attempt:failures});
       session?.close();onSession(null);
       await sleep(wait,signal);
     }finally{session?.close();onSession(null);}

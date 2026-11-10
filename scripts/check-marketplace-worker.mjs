@@ -87,6 +87,11 @@ assert.match(read('indexer/hypersync-client.mjs'),/next_block/);
 assert.match(read('indexer/hypersync-client.mjs'),/rollback_guard/);
 assert.match(workerConfig,/ENVIO_API_TOKEN/);
 assert.match(read('indexer/worker-loop.mjs'),/hypersyncReconcileMs/);
+assert.match(read('indexer/worker.mjs'),/makeLogSource=signal=>new HyperSyncLogSource/);
+assert.match(read('indexer/worker.mjs'),/state:'ENVIO_READY'/);
+assert.match(read('indexer/worker-loop.mjs'),/runLeader\(\{config,session,pool,makeClient,makeLogSource/);
+assert.match(read('indexer/worker-loop.mjs'),/state:'STANDBY'.*ADVISORY_LOCK_HELD/);
+assert.match(read('indexer/worker-loop.mjs'),/metrics\.snapshot\(\{reset:true\}\)/);
 
 assert.match(
   read('indexer/worker-loop.mjs'),

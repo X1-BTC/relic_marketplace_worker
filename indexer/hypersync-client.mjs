@@ -12,10 +12,10 @@ const num=(v,name)=>{
 const hash=v=>typeof v==='string'&&/^0x[0-9a-f]{64}$/i.test(v);
 
 export class HyperSyncLogSource {
-  constructor({apiToken,fetchImpl=globalThis.fetch,metrics={},signal,timeoutMs=60000}){
+  constructor({apiToken,fetchImpl=globalThis.fetch,metrics={},signal,timeoutMs=60000,onReady=()=>{}}){
     if(typeof apiToken!=='string'||!apiToken.trim())throw fail('HYPERSYNC_TOKEN_REQUIRED');
     if(typeof fetchImpl!=='function')throw fail('HYPERSYNC_HTTP_UNAVAILABLE');
-    this.apiToken=apiToken;this.fetchImpl=fetchImpl;this.metrics=metrics;this.signal=signal;this.timeoutMs=timeoutMs;
+    this.apiToken=apiToken;this.fetchImpl=fetchImpl;this.metrics=metrics;this.signal=signal;this.timeoutMs=timeoutMs;this.onReady=onReady;this.ready=false;
   }
   async request(fromBlock,toBlock){
     const controller=new AbortController();
@@ -88,6 +88,7 @@ export class HyperSyncLogSource {
     }
     const ordered=[...unique.values()].sort((a,b)=>a.blockNumber-b.blockNumber||a.transactionIndex-b.transactionIndex||a.logIndex-b.logIndex);
     this.metrics.logs?.(ordered.length);
+    if(!this.ready){this.ready=true;this.onReady();}
     return {logs:ordered,headers:headers.sort((a,b)=>a.number-b.number),rollbackGuards:guards};
   }
 }

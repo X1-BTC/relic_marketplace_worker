@@ -5,7 +5,7 @@ export function createServerWriterPool({Pool,connection}) {
   if (connection.ssl?.rejectUnauthorized!==true || !connection.ssl.ca || connection.ssl.key || connection.ssl.cert) throw Error('Verified TLS with explicit CA required');
   // Only a deployment-owned secret manager should construct connection. This
   // object must never cross an API/browser boundary or be serialized to logs.
-  const pool=new Pool({host:connection.host,port:connection.port ?? 5432,database:connection.database,user:connection.user,password:connection.password,ssl:{rejectUnauthorized:true,ca:connection.ssl.ca},max:2,connectionTimeoutMillis:10000,options:'-c statement_timeout=30000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=30000'});
+  const pool=new Pool({host:connection.host,port:connection.port ?? 5432,database:connection.database,user:connection.user,password:connection.password,application_name:'relic-marketplace-worker',ssl:{rejectUnauthorized:true,ca:connection.ssl.ca},max:2,connectionTimeoutMillis:10000,options:'-c statement_timeout=30000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=30000'});
   pool.on('error',()=>{}); // Never let an idle driver diagnostic expose credentials.
   return {
     async connect() {
