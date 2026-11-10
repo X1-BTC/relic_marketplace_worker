@@ -10,6 +10,8 @@ export const marketEvents = new Interface([
   `event NewListing(address indexed listingCreator,uint256 indexed listingId,address indexed assetContract,${listing} listing)`,
   `event UpdatedListing(address indexed listingCreator,uint256 indexed listingId,address indexed assetContract,${listing} listing)`,
   'event CancelledListing(address indexed listingCreator,uint256 indexed listingId)',
+  'event BuyerApprovedForListing(address indexed listingCreator,uint256 indexed listingId,bool approved)',
+  'event CurrencyApprovedForListing(address indexed listingCreator,uint256 indexed listingId,uint256 pricePerToken)',
   'event NewSale(address indexed listingCreator,uint256 indexed listingId,address indexed assetContract,uint256 tokenId,address buyer,uint256 quantityBought,uint256 totalPricePaid)',
   `event NewOffer(address indexed offeror,uint256 indexed offerId,address indexed assetContract,${offer} offer)`,
   'event CancelledOffer(address indexed offeror,uint256 indexed offerId)',
@@ -547,7 +549,8 @@ export async function readBatch({
   toBlock,
   confirmations = 12,
   head: observedHead = null,
-  anchor: observedAnchor = null
+  anchor: observedAnchor = null,
+  verifyContracts = true
 }) {
   validateManifest(manifest);
   integer(confirmations);
@@ -671,7 +674,7 @@ export async function readBatch({
   }
 
   // Verify runtime bytecode and PRINTER decimals before SQL commit.
-  await verifyChain(client, manifest, toBlock);
+  if (verifyContracts) await verifyChain(client, manifest, toBlock);
 
   return {
     expectedVersion: String(checkpoint.version),

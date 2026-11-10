@@ -46,8 +46,31 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
   const client=makeClient(cycleSignal);
   const writer=writerFactory({pool:session.pool,stream:config.stream,manifest:config.manifest});
   const wake=wakeQueue();
+  let lastIntegrityCheck=0;
+  const indexBatch=async options=>{
+    const verifyContracts=Date.now()-lastIntegrityCheck>=300000;
+    const result=await indexOnce({...options,verifyContracts,verifyIdle:verifyContracts});
+    if(verifyContracts)lastIntegrityCheck=Date.now();
+    return result;
+  };
+  const catchUp=async()=>{
+    let batches=0;
+    while(!cycleSignal.aborted){
+      const head=await client.getBlockNumber();
+      const cp=await writer.checkpoint();
+      if(head-BigInt(config.confirmations)<=BigInt(cp.block_number)){
+        await indexBatch({client,writer,confirmations:config.confirmations,batchSize:config.batchSize,checkpoint:cp,head});
+        return batches;
+      }
+      const result=await indexBatch({client,writer,confirmations:config.confirmations,batchSize:config.batchSize,checkpoint:cp,head});
+      if(result.idle)return batches;
+      batches++;
+      if(config.catchupBatchDelayMs>0)await sleep(config.catchupBatchDelayMs,cycleSignal);
+    }
+    return batches;
+  };
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
-  let reconnectFailures=0,nextReconnectAt=0,nextCheckpointUpdate=Date.now()+180000;
+  let reconnectFailures=0,nextReconnectAt=0,nextCatchupAt=0;
   const connect=async()=>{
     try{
       handle=await openSubscription({
@@ -90,26 +113,22 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     while (!cycleSignal.aborted) {
       const now = Date.now();
 
-      // Periodic checkpoint update while connected
-      if (wsConnected && now >= nextCheckpointUpdate) {
+      // WebSocket logs are hints, not a durable block feed. Scan canonical
+      // blocks periodically so an idle marketplace still advances through
+      // empty blocks and a dropped notification cannot strand the checkpoint.
+      if (now >= nextCatchupAt) {
+        let catchupFailed=false;
         try {
-          const head = await client.getBlockNumber();
-          const confirmed = head - BigInt(config.confirmations);
-          const cp = await writer.checkpoint();
-          if (confirmed > BigInt(cp.block_number)) {
-            const block = await client.getBlock({ blockNumber: confirmed });
-            await writer.advanceCheckpoint({
-              blockNumber: Number(confirmed),
-              blockHash: block.hash,
-              expectedVersion: cp.version,
-            });
-            log('checkpoint_advanced', { block: confirmed.toString() });
-          }
+          const batches=await catchUp();
+          const latest=await writer.checkpoint();
+          if(batches)log('progress',{checkpoint:String(latest.block_number),version:String(latest.version)});
+          onHealthy?.();
         } catch (err) {
-          console.error('[CHECKPOINT_COMMIT_FAILED]', err?.message || err);
-          log('alert', { code: 'CHECKPOINT_COMMIT_FAILED' });
+          catchupFailed=true;
+          console.error('[CATCHUP_FAILED]', err?.message || err);
+          log('alert', { code: 'CATCHUP_FAILED' });
         }
-        nextCheckpointUpdate = now + 180000;
+        nextCatchupAt = Date.now() + (catchupFailed?15000:Math.max(15000,config.wsFallbackMs));
       }
 
       if (!wsConnected && disconnectedAt && now - disconnectedAt >= config.alertStallMs && !disconnectAlerted) {
@@ -121,16 +140,13 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         if (handle) { try { await handle.close(); } catch (err) { console.error('[HANDLE_CLOSE_FAILED]', err?.message || err); } handle = null; }
         const connected = await connect();
         if (connected) {
-          // On reconnect: scan from checkpoint to current confirmed + margin
+          // On reconnect, recover from PostgreSQL to the confirmed head in bounded batches.
           try {
             const cp = await writer.checkpoint();
-            const head = await client.getBlockNumber();
-            const target = head - BigInt(config.confirmations) + 100n;
-            if (target > BigInt(cp.block_number)) {
-              log('reconnect_scan', { from: cp.block_number, to: target.toString() });
-              await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: 200, checkpoint: cp, head, verifyIdle: true });
-            }
+            log('reconnect_scan', { from: cp.block_number, to: 'confirmed_head' });
+            await catchUp();
           } catch (err) {
+            nextCatchupAt=Date.now()+15000;
             console.error('[RECONNECT_SCAN_FAILED]', err?.message || err);
             log('alert', { code: 'RECONNECT_SCAN_FAILED' });
           }
@@ -142,9 +158,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       // Light catch-up while disconnected
       if (!wsConnected) {
         try {
-          const cp = await writer.checkpoint();
-          const head = await client.getBlockNumber();
-          await indexOnce({ client, writer, confirmations: config.confirmations, batchSize: 10, checkpoint: cp, head, verifyIdle: false });
+          await catchUp();
         } catch (err) {
           console.error('[DISCONNECTED_CATCHUP_FAILED]', err?.message || err);
           log('alert', { code: 'DISCONNECTED_CATCHUP_FAILED' });
@@ -153,7 +167,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         continue;
       }
 
-      const timeout = 60000;
+      const timeout = Math.min(60000,Math.max(1000,nextCatchupAt-Date.now()));
       const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
 
       if (signalResult.kind === 'aborted') break;
@@ -169,18 +183,10 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       // Notification with blockNumber
       if (signalResult.blockNumber) {
         try {
-          const cp = await writer.checkpoint();
-          await indexOnce({
-            client,
-            writer,
-            confirmations: config.confirmations,
-            batchSize: 50,
-            checkpoint: cp,
-            head: BigInt(signalResult.blockNumber) + 10n,
-            verifyIdle: false,
-          });
+          await catchUp();
           log('event_processed', { block: signalResult.blockNumber });
         } catch (err) {
+          nextCatchupAt=Date.now()+15000;
           console.error('[EVENT_PROCESS_FAILED]', err?.message || err);
           log('alert', { code: 'EVENT_PROCESS_FAILED' });
         }
