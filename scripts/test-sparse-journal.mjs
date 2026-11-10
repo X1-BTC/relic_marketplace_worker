@@ -357,7 +357,7 @@ function rpc({logs=[],orphan=false}={}){
   const encoded=marketEvents.encodeEventLog(fragment,['0x0000000000000000000000000000000000000001',250]);
   const event={address:manifest.marketplace,blockNumber:eventBlock,blockHash:H(eventBlock),transactionHash:tx,
     transactionIndex:0,logIndex:0,topics:encoded.topics,data:encoded.data,removed:false,blockTimestamp:null};
-  const storedBlocks=new Map(),sql=[];
+  const storedBlocks=new Map(),sql=[];let journalCount=0,firstInsert=true;
   const db={async query(text,values=[]){sql.push(text);
     if(text==='BEGIN'||text==='COMMIT'||text==='ROLLBACK')return {rows:[]};
     if(text.includes('SELECT * FROM relic_market_indexer.checkpoints'))return {rows:[{...checkpoint,block_number:base+100,block_hash:H(base+100)}]};
@@ -368,10 +368,11 @@ function rpc({logs=[],orphan=false}={}){
     ]};
     if(text.includes('INSERT INTO relic_market_indexer.blocks')){storedBlocks.set(values[1],{block_hash:values[2],parent_hash:values[3]});return {rows:[]};}
     if(text.includes('SELECT block_hash,parent_hash FROM relic_market_indexer.blocks'))return {rows:[storedBlocks.get(values[1])]};
-    if(text.includes('SELECT max(block_number) AS block_number'))return {rows:[{block_number:null}]};
-    if(text.includes('SELECT count(*)::text AS count FROM relic_market_indexer.events'))return {rows:[{count:'0'}]};
-    if(text.includes('INSERT INTO public.relic_market_raw_events'))return {rows:[{chain_id:4663}]};
-    if(text.includes('INSERT INTO relic_market_indexer.events'))return {rows:[]};
+    if(text.includes('SELECT max(block_number) AS block_number'))return {rows:[{block_number:journalCount?eventBlock:null}]};
+    if(text.includes('SELECT count(*)::text AS count FROM relic_market_indexer.events'))return {rows:[{count:String(journalCount)}]};
+    if(text.includes('INSERT INTO public.relic_market_raw_events')){if(firstInsert){firstInsert=false;return {rows:[{chain_id:4663}]};}return {rows:[]};}
+    if(text.includes('SELECT r.*,j.stream AS owner_stream'))return {rows:[{...rawRow(event,manifest),topics:event.topics,owner_stream:'relic-mainnet'}]};
+    if(text.includes('INSERT INTO relic_market_indexer.events')){journalCount++;return {rows:[]};}
     if(text.includes('INSERT INTO public.relic_market_activity'))return {rows:[{chain_id:4663}]};
     if(text.includes('INSERT INTO public.relic_market_config_events'))return {rows:[{chain_id:4663}]};
     throw Error(`Unexpected SQL in historical replay test: ${text}`);
@@ -382,6 +383,9 @@ function rpc({logs=[],orphan=false}={}){
   assert.equal(result.unchangedCheckpoint,true);
   assert.equal(result.blockNumber,base+100);
   assert.equal(result.replayedEvents,1);
+  const replayedAgain=await writer.replayHistorical({expectedVersion:'7',range:{fromBlock:base+1,toBlock:base+20},
+    blocks:[{number:eventBlock,hash:H(eventBlock),parentHash:H(eventBlock-1)},{number:base+20,hash:H(base+20),parentHash:H(base+19)}],events:[event]});
+  assert.equal(replayedAgain.replayedEvents,1,'replaying the same canonical event is idempotent');
   assert.ok(sql.some(text=>text.includes('entity_undo'))===false,'configuration-only history requires no entity undo rows');
   assert.ok(!sql.some(text=>text.includes('UPDATE relic_market_indexer.checkpoints')),'historical replay never rewinds or advances checkpoint');
   await assert.rejects(writer.replayHistorical({expectedVersion:'7',range:{fromBlock:base+1,toBlock:base+101},blocks:[{number:base+101,hash:H(base+101),parentHash:H(base+100)}],events:[]}),/Indexer transaction failed/);

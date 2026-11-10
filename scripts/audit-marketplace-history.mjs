@@ -1,9 +1,10 @@
 import {HyperSyncLogSource} from '../indexer/hypersync-client.mjs';
 import {sharedHyperSyncScheduler} from '../indexer/hypersync-scheduler.mjs';
-import {decode,manifestDigest,validateManifest,readBatch,project} from '../indexer/marketplace.mjs';
+import {decode,manifestDigest,validateManifest,readBatch,project,normalizeLog,eventKey,json} from '../indexer/marketplace.mjs';
 import {businessRows} from '../indexer/business-tables.mjs';
 import {marketplaceOnlyClient} from '../indexer/marketplace-only-client.mjs';
 import {envioHyperRpcUrl,hybridReadClient,createRpcStatusFetch} from '../indexer/hybrid-rpc.mjs';
+import {pathToFileURL} from 'node:url';
 
 const DEPLOYMENT_BLOCK=99_777_330;
 const RANGE_BLOCKS=10_000;
@@ -15,10 +16,23 @@ const LISTING_EVENTS=new Set(['NewListing','UpdatedListing','CancelledListing','
 const OFFER_EVENTS=new Set(['NewOffer','CancelledOffer','AcceptedOffer']);
 const SALE_EVENTS=new Set(['NewSale','AcceptedOffer']);
 const CANCELLATION_EVENTS=new Set(['CancelledListing','CancelledOffer']);
+export const TARGETED_TRANSACTIONS=Object.freeze([
+  {block:100786855,hash:'0x60ecae79edc341c6e19d672ac819f8060c606f8707422aada60d0e7468a6b84f'},
+  {block:100792665,hash:'0x1b2cab93fbfc64f44d5dd4d07cbbc80d213e8597a4ef7f44e5ee2cc9812c544a'},
+  {block:100803626,hash:'0xab3008e3570893a8f2c956fa92385101292e4ecc6d274cbd8bab57e248d71fcc'},
+  {block:100809473,hash:'0xd8da80961e134a5231cd91d54d4d759caa8056bb128cca791e32d8a6992c10'},
+  {block:100813966,hash:'0xa37502403ec62ce5b7458e06b1e097d4f242dbd27b9aaa2a3c623437b58fc35f'},
+  {block:100830176,hash:'0x68f725827ccdb782cd2a531eec1195da0f1ce61a912f50a9b2f18be2d3f59bef'},
+  {block:101762900,hash:'0xba8739d4bcda7dda5da929190289ea37e438af71cb41989bf8ebdbb77b99bdf3'},
+  {block:110532996,hash:'0x7905185ab75b3da485acdb22efaf88d5c724152e0a4010ef9e252db6b2a6607f'},
+  {block:110541864,hash:'0xb3c8e654f87f33a1800080cf21435fc51cc7497ca775b6a0f26483d587dcd6c5'},
+  {block:110560579,hash:'0x43d9b857246f88429a9e24d1e1d4b9dd620e0b69bd0c61255cfca57b5298699a'},
+  {block:110693216,hash:'0xf9512ab91b8163fa11311b8ee0995b5fdfa393206282ab9fe80990539b832891'},
+].map(x=>Object.freeze({...x,hash:x.hash.toLowerCase()})));
 
 function out(event,fields={}){process.stdout.write(`${JSON.stringify({time:new Date().toISOString(),event,...fields})}\n`);}
 function requireEnv(name){const value=process.env[name];if(typeof value!=='string'||!value.trim())throw Error(`AUDIT_BINDING_MISSING:${name}`);return value;}
-function parseConfig(){
+function parseConfig({targeted=false}={}){
   const manifest=validateManifest(JSON.parse(requireEnv('RM_MARKETPLACE_MANIFEST')));
   if(manifest.marketplace.toLowerCase()!==MARKETPLACE)throw Error('AUDIT_MANIFEST_MARKETPLACE_MISMATCH');
   const stream=process.env.RM_INDEXER_STREAM||STREAM;
@@ -37,10 +51,63 @@ function parseConfig(){
   if(port!==5432)throw Error('AUDIT_DB_PORT_INVALID');
   const database=requireEnv('RM_DB_NAME');
   if(!/^[a-zA-Z0-9_]+$/.test(database))throw Error('AUDIT_DB_NAME_INVALID');
-  return {manifest,stream,token:requireEnv('ENVIO_API_TOKEN'),alchemyUrl:requireEnv('RM_MARKETPLACE_ALCHEMY_HTTP_URL'),connection:{
+  return {manifest,stream,token:targeted?null:requireEnv('ENVIO_API_TOKEN'),alchemyUrl:requireEnv('RM_MARKETPLACE_ALCHEMY_HTTP_URL'),connection:{
     host,port,database,user,password:requireEnv('RM_DB_PASSWORD'),
     ssl:{rejectUnauthorized:true,ca},
   }};
+}
+
+const TARGET_RELEVANT_ADDRESSES=manifest=>new Set([manifest.marketplace,manifest.nft,manifest.printer].map(x=>x.toLowerCase()));
+const asNumber=(v,label)=>{const n=Number(v);if(!Number.isSafeInteger(n)||n<0)throw Error(`TARGETED_INVALID_${label}`);return n;};
+
+// Pure verification helpers are exported so the targeted path can be regression-tested
+// without RPC or database credentials.
+export function verifyTargetedReceipt({expected,receipt,canonicalBlock,head,manifest}){
+  if(!receipt)throw Error('TARGETED_RECEIPT_MISSING');
+  if(String(receipt.status).toLowerCase()!=='success'&&receipt.status!==1&&receipt.status!==1n)throw Error('TARGETED_RECEIPT_FAILED');
+  if(receipt.transactionHash?.toLowerCase()!==expected.hash.toLowerCase())throw Error('TARGETED_RECEIPT_HASH_MISMATCH');
+  const block=asNumber(receipt.blockNumber,'RECEIPT_BLOCK');
+  if(block!==expected.block)throw Error('TARGETED_RECEIPT_BLOCK_MISMATCH');
+  if(asNumber(canonicalBlock.number,'CANONICAL_BLOCK')!==expected.block)throw Error('TARGETED_CANONICAL_BLOCK_NUMBER_MISMATCH');
+  if(!/^0x[0-9a-fA-F]{64}$/.test(canonicalBlock.hash)||!/^0x[0-9a-fA-F]{64}$/.test(canonicalBlock.parentHash??''))throw Error('TARGETED_CANONICAL_BLOCK_MALFORMED');
+  if(!canonicalBlock?.hash||canonicalBlock.hash.toLowerCase()!==receipt.blockHash?.toLowerCase())throw Error('TARGETED_CANONICAL_HASH_MISMATCH');
+  if(asNumber(head,'HEAD')-block<12)throw Error('TARGETED_CONFIRMATIONS_INSUFFICIENT');
+  const txIndex=asNumber(receipt.transactionIndex,'TRANSACTION_INDEX');
+  const seen=new Set(),normalized=[];let priorLogIndex=-1;
+  for(const log of receipt.logs??[]){
+    if(log.removed)throw Error('TARGETED_REMOVED_LOG');
+    if(log.transactionHash?.toLowerCase()!==expected.hash.toLowerCase()||asNumber(log.blockNumber,'LOG_BLOCK')!==block||log.blockHash?.toLowerCase()!==canonicalBlock.hash.toLowerCase()||asNumber(log.transactionIndex,'LOG_TRANSACTION_INDEX')!==txIndex)throw Error('TARGETED_LOG_IDENTITY_MISMATCH');
+    const li=asNumber(log.logIndex,'LOG_INDEX');if(seen.has(li))throw Error('TARGETED_DUPLICATE_LOG_INDEX');if(li<=priorLogIndex)throw Error('TARGETED_LOG_ORDER_INVALID');priorLogIndex=li;seen.add(li);
+    const address=log.address?.toLowerCase();
+    if(!TARGET_RELEVANT_ADDRESSES(manifest).has(address))continue;
+    normalized.push(normalizeLog({...log,blockNumber:block,logIndex:li,transactionIndex:txIndex,blockTimestamp:new Date(Number(canonicalBlock.timestamp)*1000).toISOString()}));
+  }
+  const market=normalized.filter(x=>x.address===manifest.marketplace.toLowerCase());
+  if(!market.length)throw Error('TARGETED_MARKETPLACE_LOG_MISSING');
+  return normalized.sort((a,b)=>a.transactionIndex-b.transactionIndex||a.logIndex-b.logIndex);
+}
+
+export function targetedReplayBatches(verifiedReceipts,checkpoint,manifest){
+  const byBlock=new Map();
+  for(const item of verifiedReceipts){
+    const number=asNumber(item.block.number,'REPLAY_BLOCK');
+    const logs=item.logs??[];const prior=byBlock.get(number)??{block:{number,hash:item.block.hash.toLowerCase(),parentHash:item.block.parentHash.toLowerCase()},events:[]};
+    if(prior.block.hash!==item.block.hash.toLowerCase()||prior.block.parentHash!==item.block.parentHash.toLowerCase())throw Error('TARGETED_BLOCK_CONFLICT');
+    prior.events.push(...logs);byBlock.set(number,prior);
+  }
+  return [...byBlock.values()].sort((a,b)=>a.block.number-b.block.number).map(x=>{
+    const seen=new Map();
+    for(const e of x.events){const key=eventKey(e),old=seen.get(key);if(old&&json(old)!==json(e))throw Error('TARGETED_DUPLICATE_CONFLICT');seen.set(key,e);}
+    const events=[...seen.values()].sort((a,b)=>a.blockNumber-b.blockNumber||a.transactionIndex-b.transactionIndex||a.logIndex-b.logIndex);
+    return {expectedVersion:String(checkpoint.version),range:{fromBlock:x.block.number,toBlock:x.block.number},blocks:[x.block],events};
+  });
+}
+
+export function verifyTargetedProjection(events,manifest){
+  const ordered=[...events].sort((a,b)=>a.blockNumber-b.blockNumber||a.transactionIndex-b.transactionIndex||a.logIndex-b.logIndex);
+  const state=project(ordered,manifest),rows=businessRows(ordered,state,manifest,STREAM);
+  const ambiguous=rows.relic_market_settlements.filter(x=>x.reconcile_status!=='RECONCILED');
+  return {state,rows,ambiguous};
 }
 
 function classify(log,manifest){
@@ -83,7 +150,7 @@ async function readOnly(pool,work){
   finally{db.release();}
 }
 
-async function run(){
+async function runFull(){
   const config=parseConfig();
   const pg=await import('pg');
   const pool=new pg.Pool({...config.connection,application_name:'relic-market-history-audit',max:1,connectionTimeoutMillis:15000,
@@ -179,7 +246,82 @@ async function compareBatch(items,config,pool,missing,businessMissing){
   return missingIdentityCount;
 }
 
-run().catch(error=>{
+async function runTargeted(){
+  const config=parseConfig({targeted:true});
+  const pg=await import('pg'),viem=await import('viem');
+  const pool=new pg.Pool({...config.connection,application_name:'relic-market-targeted-receipt-audit',max:1,connectionTimeoutMillis:15000,
+    options:'-c default_transaction_read_only=on -c statement_timeout=30000 -c lock_timeout=5000'});
+  const chain=viem.defineChain({id:4663,name:'Robinhood Mainnet',nativeCurrency:{name:'RHBTC',symbol:'RHBTC',decimals:18},rpcUrls:{default:{http:[config.alchemyUrl]}}});
+  const alchemy=viem.createPublicClient({chain,transport:viem.http(config.alchemyUrl,{retryCount:0,timeout:20000,batch:false}),cacheTime:0});
+  const client=marketplaceOnlyClient(alchemy,config.manifest);
+  try{
+    const [chainId,head,checkpoint,dbMeta]=await Promise.all([
+      client.getChainId(),client.getBlockNumber(),
+      readOnly(pool,async db=>{
+        const q=await db.query(`SELECT stream,chain_id,anchor_number,anchor_hash,block_number,block_hash,version,manifest_digest,manifest FROM relic_market_indexer.checkpoints WHERE stream=$1`,[config.stream]);
+        if(q.rows.length!==1)throw Error('AUDIT_CHECKPOINT_NOT_UNIQUE');
+        const cp=q.rows[0];
+        if(Number(cp.chain_id)!==4663||manifestDigest(cp.manifest)!==cp.manifest_digest||manifestDigest(config.manifest)!==cp.manifest_digest)throw Error('AUDIT_CHECKPOINT_MANIFEST_MISMATCH');
+        if(Number(cp.block_number)<Math.max(...TARGETED_TRANSACTIONS.map(x=>x.block)))throw Error('AUDIT_CHECKPOINT_BEHIND_TARGETS');
+        const boundary=await db.query('SELECT block_hash FROM relic_market_indexer.blocks WHERE stream=$1 AND block_number=$2',[config.stream,cp.block_number]);
+        if(boundary.rows.length!==1||boundary.rows[0].block_hash.toLowerCase()!==cp.block_hash.toLowerCase())throw Error('AUDIT_CHECKPOINT_BOUNDARY_MISMATCH');
+        return cp;
+      }),
+      readOnly(pool,async db=>{
+        const rels=['relic_market_indexer.checkpoints','relic_market_indexer.blocks','relic_market_indexer.events','relic_market_indexer.entity_undo','public.relic_market_contracts','public.relic_market_raw_events','public.relic_market_listings','public.relic_market_offers','public.relic_market_activity','public.relic_market_settlements','public.relic_market_payment_transfers','public.relic_market_config_events'];
+        const r=[];for(const relation of rels){const x=await db.query('SELECT to_regclass($1) IS NOT NULL AS present',[relation]);r.push({relation,present:x.rows[0]?.present===true});}
+        if(r.some(x=>!x.present))throw Error('AUDIT_REQUIRED_RELATION_MISSING');
+        const registry=await db.query('SELECT role,contract_address,start_block,enabled FROM public.relic_market_contracts WHERE chain_id=4663 AND contract_address=ANY($1::text[])',[[config.manifest.marketplace,config.manifest.nft,config.manifest.printer].map(x=>x.toLowerCase())]);
+        const expected={MARKETPLACE_V3:config.manifest.marketplace.toLowerCase(),RELIC_NFT:config.manifest.nft.toLowerCase(),PRINTER:config.manifest.printer.toLowerCase()};
+        for(const [role,address] of Object.entries(expected)){const x=registry.rows.find(y=>y.role===role&&y.contract_address===address&&y.enabled===true);if(!x||BigInt(x.start_block)>BigInt(TARGETED_TRANSACTIONS[0].block))throw Error('AUDIT_REGISTRY_MISMATCH');}
+        const cfg=await db.query('SELECT count(*)::text AS count FROM public.relic_market_config_events WHERE chain_id=4663 AND marketplace_address=$1',[config.manifest.marketplace.toLowerCase()]);
+        return {registry:registry.rows.map(x=>({role:x.role,contract_address:x.contract_address,start_block:String(x.start_block),enabled:x.enabled})),existingConfigEventRows:cfg.rows[0]?.count??'0'};
+      }),
+    ]);
+    if(chainId!==4663)throw Error('AUDIT_CHAIN_ID_MISMATCH');
+    const verified=[];
+    for(const expected of TARGETED_TRANSACTIONS){
+      // Exactly one receipt lookup per supplied hash; no eth_getLogs requests.
+      const receipt=await client.getTransactionReceipt({hash:expected.hash});
+      const canonicalBlock=await client.getBlock({blockNumber:BigInt(expected.block)});
+      const logs=verifyTargetedReceipt({expected,receipt,canonicalBlock,head,manifest:config.manifest});
+      verified.push({expected,receipt,block:canonicalBlock,logs});
+    }
+    const allLogs=verified.flatMap(x=>x.logs).sort((a,b)=>a.blockNumber-b.blockNumber||a.transactionIndex-b.transactionIndex||a.logIndex-b.logIndex);
+    const unique=new Map();for(const log of allLogs){const key=eventKey(log),old=unique.get(key);if(old&&JSON.stringify(old)!==JSON.stringify(log))throw Error('TARGETED_DUPLICATE_CONFLICT');unique.set(key,log);}
+    const events=[...unique.values()].sort((a,b)=>a.blockNumber-b.blockNumber||a.transactionIndex-b.transactionIndex||a.logIndex-b.logIndex);
+    const classifications=events.map(log=>({log,...classify(log,config.manifest)}));
+    const typeCounts={};for(const x of classifications)typeCounts[x.eventName]=(typeCounts[x.eventName]??0)+1;
+    const projection=verifyTargetedProjection(events,config.manifest);
+    const replayBatches=targetedReplayBatches(verified.map(x=>({block:x.block,logs:x.logs})),checkpoint,config.manifest);
+    const source=classifications.map(x=>({transactionHash:x.log.transactionHash,logIndex:x.log.logIndex,blockNumber:x.log.blockNumber,eventName:x.eventName,kind:x.kind,entityId:x.entityId??'',address:x.log.address}));
+    const dbCompare=await readOnly(pool,async db=>{
+      const arrays=[source.map(x=>x.transactionHash),source.map(x=>x.logIndex),source.map(x=>x.blockNumber),source.map(x=>x.eventName),source.map(x=>x.kind),source.map(x=>x.entityId),source.map(x=>x.address)];
+      const q=await db.query(`WITH s AS (SELECT * FROM unnest($1::text[],$2::integer[],$3::bigint[],$4::text[],$5::text[],$6::text[],$7::text[]) AS x(transaction_hash,log_index,block_number,event_name,kind,entity_id,address))
+        SELECT s.*,
+          EXISTS(SELECT 1 FROM relic_market_indexer.events e WHERE e.stream=$8 AND e.transaction_hash=s.transaction_hash AND e.log_index=s.log_index) journal_present,
+          EXISTS(SELECT 1 FROM public.relic_market_raw_events r WHERE r.chain_id=4663 AND r.transaction_hash=s.transaction_hash AND r.log_index=s.log_index AND lower(r.contract_address)=s.address) raw_present,
+          CASE WHEN s.address=$9 OR s.address=$10 THEN EXISTS(SELECT 1 FROM public.relic_market_activity a WHERE a.chain_id=4663 AND a.marketplace_address=$9 AND a.transaction_hash=s.transaction_hash AND a.log_index=s.log_index AND a.ingest_source='LIVE') ELSE true END activity_present,
+          CASE WHEN s.kind='LISTING' THEN EXISTS(SELECT 1 FROM public.relic_market_listings l WHERE l.chain_id=4663 AND l.marketplace_address=$9 AND l.listing_id=s.entity_id::numeric AND (l.last_block_number>s.block_number OR (l.last_block_number=s.block_number AND l.last_log_index>=s.log_index)))
+               WHEN s.kind='OFFER' THEN EXISTS(SELECT 1 FROM public.relic_market_offers o WHERE o.chain_id=4663 AND o.marketplace_address=$9 AND o.offer_id=s.entity_id::numeric AND (o.last_block_number>s.block_number OR (o.last_block_number=s.block_number AND o.last_log_index>=s.log_index))) ELSE true END entity_present,
+          CASE WHEN s.event_name IN ('NewSale','AcceptedOffer') THEN EXISTS(SELECT 1 FROM public.relic_market_settlements z WHERE z.chain_id=4663 AND z.marketplace_address=$9 AND z.transaction_hash=s.transaction_hash AND z.sale_log_index=s.log_index)
+               WHEN s.kind='CONFIG' THEN EXISTS(SELECT 1 FROM public.relic_market_config_events c WHERE c.chain_id=4663 AND c.marketplace_address=$9 AND c.transaction_hash=s.transaction_hash AND c.log_index=s.log_index) ELSE true END specialized_present,
+          CASE WHEN s.address=$10 THEN EXISTS(SELECT 1 FROM public.relic_market_payment_transfers p WHERE p.chain_id=4663 AND p.transaction_hash=s.transaction_hash AND p.log_index=s.log_index) ELSE true END payment_present
+        FROM s ORDER BY s.block_number,s.transaction_hash,s.log_index`,[...arrays,config.stream,config.manifest.marketplace.toLowerCase(),config.manifest.printer.toLowerCase()]);
+      return q.rows;
+    });
+    const missing=dbCompare.filter(x=>!x.journal_present||!x.raw_present||!x.activity_present||!x.entity_present||!x.specialized_present||!x.payment_present).map(x=>({blockNumber:String(x.block_number),transactionHash:x.transaction_hash,logIndex:x.log_index,eventName:x.event_name,kind:x.kind,missing:{...(!x.journal_present&&{journal:true}),...(!x.raw_present&&{raw:true}),...(!x.activity_present&&{activity:true}),...(!x.entity_present&&{entity:true}),...(!x.specialized_present&&{specialized:true}),...(!x.payment_present&&{paymentTransfer:true})}}));
+    const types={};for(const x of classifications){const d=decode(x.log,config.manifest);types[d?.name??x.eventName]=(types[d?.name??x.eventName]??0)+1;}
+    const receiptSummary=verified.map(x=>({block:x.expected.block,transactionHash:x.expected.hash,status:'success',blockHash:x.block.hash,transactionIndex:Number(x.receipt.transactionIndex),marketplaceLogs:x.logs.filter(l=>l.address===config.manifest.marketplace.toLowerCase()).length,relevantLogs:x.logs.length}));
+    const replayReady=projection.ambiguous.length===0&&missing.length>0&&missing.every(x=>x.missing.journal||x.missing.raw);
+    out('targeted_audit_summary',{mode:'targeted_receipts_only',chainId,head:String(head),confirmationsRequired:12,transactions:receiptSummary,eventCountsByDecodedType:types,receiptLogCount:events.length,duplicateIdentitiesRemoved:allLogs.length-events.length,missingDatabaseIdentities:missing,ambiguousSettlements:projection.ambiguous.map(x=>({transactionHash:x.transaction_hash,logIndex:x.sale_log_index,status:x.reconcile_status})),existingDatabase:dbMeta,checkpoint:{blockNumber:String(checkpoint.block_number),version:String(checkpoint.version)},configurationSource:'RM_MARKETPLACE_MANIFEST validated and digest matched against checkpoint; contract registry independently verified',rpc:{receiptLookups:11,canonicalBlockReads:11,ethGetLogs:0},replayReady,replayNotReadyReason:replayReady?null:projection.ambiguous.length?'AMBIGUOUS_SETTLEMENT':'NO_MISSING_EVENT_IDENTITY_OR_PROJECTION_ONLY_MISSING',replayBatches,fullHistoryAdministrativeCompleteness:'NOT_ESTABLISHED_BY_TARGETED_RECEIPTS',databaseWrites:0});
+  }finally{await pool.end();}
+}
+
+const mode=process.argv.includes('--full')?'full':'targeted';
+const run=mode==='full'?runFull:runTargeted;
+if(process.argv.includes('--help')){out('usage',{targeted:'node scripts/audit-marketplace-history.mjs --targeted',full:'node scripts/audit-marketplace-history.mjs --full (not for targeted recovery)'});}
+else if(import.meta.url===pathToFileURL(process.argv[1]??'').href)run().catch(error=>{
   const missingBinding=typeof error?.message==='string'?error.message.match(/^AUDIT_BINDING_MISSING:([A-Z0-9_]+)$/):null;
   const code=missingBinding?'AUDIT_BINDING_MISSING':typeof error?.message==='string'&&/^AUDIT_[A-Z0-9_]+$/.test(error.message)?error.message:
     error?.code==='HYPERSYNC_HTTP_429'?'HYPERSYNC_HTTP_429':error?.code?.startsWith('HYPERSYNC_')?error.code:
