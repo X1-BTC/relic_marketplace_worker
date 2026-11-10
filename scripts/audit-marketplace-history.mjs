@@ -324,7 +324,7 @@ if(process.argv.includes('--help')){out('usage',{targeted:'node scripts/audit-ma
 else if(import.meta.url===pathToFileURL(process.argv[1]??'').href)run().catch(error=>{
   const missingBinding=typeof error?.message==='string'?error.message.match(/^AUDIT_BINDING_MISSING:([A-Z0-9_]+)$/):null;
   const code=missingBinding?'AUDIT_BINDING_MISSING':typeof error?.message==='string'&&/^AUDIT_[A-Z0-9_]+$/.test(error.message)?error.message:
-    error?.code==='HYPERSYNC_HTTP_429'?'HYPERSYNC_HTTP_429':error?.code?.startsWith('HYPERSYNC_')?error.code:
+    error?.code==='HYPERSYNC_HTTP_429'?'HYPERSYNC_HTTP_429':String(error?.code ?? '').startsWith('HYPERSYNC_')?error.code:
     error?.code==='28P01'?'AUDIT_DATABASE_AUTH_FAILED':error?.code==='ETIMEDOUT'?'AUDIT_DATABASE_TIMEOUT':'AUDIT_FAILED';
   out('audit_failed',{code,binding:missingBinding?.[1],httpStatus:error?.httpStatus,fromBlock:error?.fromBlock,toBlock:error?.toBlock,nextBlock:error?.nextBlock});
   process.exitCode=1;
