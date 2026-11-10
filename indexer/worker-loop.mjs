@@ -11,7 +11,7 @@ async function sleep(ms,signal){if(ms<=0)return;try{await delay(ms,undefined,{si
 const reorgMessage=e=>['Reorg: explicit recovery required','Reorg: recovery required','Reorg during collection','Reorg at verified range boundary','HyperSync rollback guard mismatch','HyperSync endpoint hash mismatch','HyperSync log/header mismatch','HyperSync canonical range invalid','Log block hash mismatch','Removed log; recover canonical checkpoint first'].includes(e?.message)||['HYPERSYNC_REORG_DETECTED'].includes(e?.code);
 const bytecodeMismatch=e=>/^Unauthorized (nft|printer|marketplace) bytecode$/.test(e?.message ?? '');
 const safeFailures=new Map([
-  ['Batch must contain 1–1000 blocks','BATCH_RANGE_INVALID'],['Unconfirmed batch','BATCH_NOT_CONFIRMED'],
+  ['Batch must contain 1–10000 blocks','BATCH_RANGE_INVALID'],['Unconfirmed batch','BATCH_NOT_CONFIRMED'],
   ['Missing/failed receipt','RECEIPT_VALIDATION_FAILED'],['Log/receipt mismatch','RECEIPT_LOG_MISMATCH'],
   ['Reorg: explicit recovery required','REORG_ANCHOR_MISMATCH'],['Reorg: recovery required','REORG_ANCHOR_MISMATCH'],
   ['Reorg during collection','REORG_DURING_COLLECTION'],['Reorg below anchor: reviewed replacement required','REORG_RECOVERY_BELOW_ANCHOR'],
@@ -41,6 +41,10 @@ function wakeQueue() {
 
 function retryDelay(config,attempt){return jitter(Math.min(config.wsReconnectMaxMs,config.wsReconnectMinMs*2**Math.min(attempt-1,10)));}
 
+export function checkpointBehindConfirmedHead(head,checkpoint,confirmations=12){
+  return BigInt(head)-BigInt(confirmations)>BigInt(checkpoint);
+}
+
 async function runLeader({config,session,pool,makeClient,makeLogSource,signal,log,openSubscription,metrics,writerFactory,onHealthy}) {
   const cycleSignal=AbortSignal.any([signal,session.signal]);
   const client=makeClient(cycleSignal);
@@ -55,25 +59,51 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
     if(verifyContracts)integrityVerified=true;
     return result;
   };
-  const catchUp=async()=>{
+  const catchUp=async(mode='STARTUP_CATCHUP')=>{
     let batches=0;
+    // One confirmed-head snapshot bounds this pass. While caught up, only the
+    // checkpoint anchor is checked; no HyperSync empty-range query is issued.
+    const head=await client.getBlockNumber();
     while(!cycleSignal.aborted){
-      const head=await client.getBlockNumber();
       const cp=await writer.checkpoint();
-      if(head-BigInt(config.confirmations)<=BigInt(cp.block_number)){
-        await indexBatch({client,writer,confirmations:config.confirmations,batchSize:1000,checkpoint:cp,head});
-        return batches;
+      if(!checkpointBehindConfirmedHead(head,cp.block_number,config.confirmations)){
+        if(batches===0){
+          const anchor=await client.getBlock({blockNumber:BigInt(cp.block_number)});
+          if(anchor.hash!==cp.block_hash)throw Error('Reorg: explicit recovery required');
+        }
+        log('worker_status',{state:'LIVE_CAUGHT_UP',component:mode,checkpoint:String(cp.block_number),head:String(head),lagBlocks:0});
+        return {batches,caughtUp:true,head};
       }
-      const result=await indexBatch({client,writer,confirmations:config.confirmations,batchSize:1000,checkpoint:cp,head});
-      if(result.idle)return batches;
+      if(batches===0)log('worker_status',{state:'CATCHING_UP',component:mode,checkpoint:String(cp.block_number),head:String(head),lagBlocks:String(head-BigInt(config.confirmations)-BigInt(cp.block_number))});
+      const result=await indexBatch({client,writer,confirmations:config.confirmations,batchSize:config.hypersyncRangeBlocks,checkpoint:cp,head});
+      if(result.idle)return {batches,caughtUp:true,head};
       batches++;
       if(config.catchupBatchDelayMs>0)await sleep(config.catchupBatchDelayMs,cycleSignal);
     }
-    return batches;
+    return {batches,caughtUp:false,head};
   };
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
   let reconnectFailures=0,nextReconnectAt=0,nextCatchupAt=0,nextConfirmAt=0,pendingEventBlock=0;
-  const metricsTimer=metrics?.snapshot?setInterval(()=>log('rpc_metrics',metrics.snapshot({reset:true})),60000):null;
+  let envioFailures=0,nextRetryAt=0;
+  const retryCatchup=(error,component)=>{
+    const envioFailure=typeof error?.code==='string'&&error.code.startsWith('HYPERSYNC_');
+    let delayMs=15000;
+    if(envioFailure){
+      envioFailures++;
+      delayMs=Math.min(300000,15000*2**Math.min(envioFailures-1,5));
+      if(Number.isSafeInteger(error.retryAfterMs)&&error.retryAfterMs>delayMs)delayMs=Math.min(900000,error.retryAfterMs);
+    }
+    log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':component,reason:envioFailure?error.code:workerCode(error),delayMs,httpStatus:error?.httpStatus,retryAfterMs:error?.retryAfterMs,from:error?.fromBlock,to:error?.toBlock,nextBlock:error?.nextBlock});
+    nextRetryAt=nextCatchupAt=Date.now()+delayMs;
+    return delayMs;
+  };
+  let lastMetricsAt=Date.now();
+  const metricsTimer=metrics?.snapshot?setInterval(()=>{
+    const sampledAt=Date.now(),elapsedSeconds=Math.max(1,(sampledAt-lastMetricsAt)/1000);lastMetricsAt=sampledAt;
+    const snapshot=metrics.snapshot({reset:true});
+    snapshot.hypersyncVerifiedBlocksPerSecond=Number((snapshot.hypersyncBlocksVerified/elapsedSeconds).toFixed(2));
+    log('rpc_metrics',snapshot);
+  },60000):null;
   metricsTimer?.unref?.();
   const connect=async()=>{
     try{
@@ -129,12 +159,14 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
     while (!cycleSignal.aborted) {
       const now = Date.now();
 
-      // WebSocket notifications wake confirmation processing. HyperSync runs
-      // periodically as a completeness check, even when no notification arrives.
-      if (now >= nextCatchupAt || (nextConfirmAt&&now>=nextConfirmAt)) {
+      // Startup, due confirmations and five-minute reconciliation each take
+      // one confirmed-head snapshot. No periodic empty ranges run while caught up.
+      if (now >= nextRetryAt && (now >= nextCatchupAt || (nextConfirmAt&&now>=nextConfirmAt))) {
         let catchupFailed=false;
         try {
-          const batches=await catchUp();
+          const mode=nextCatchupAt===0?'STARTUP_CATCHUP':nextConfirmAt&&now>=nextConfirmAt?'CONFIRMATION_RECOVERY':'PERIODIC_RECONCILIATION';
+          const {batches}=await catchUp(mode);
+          envioFailures=0;nextRetryAt=0;
           const latest=await writer.checkpoint();
           if(batches)log('progress',{checkpoint:String(latest.block_number),version:String(latest.version)});
           if(pendingEventBlock&&Number(latest.block_number)>=pendingEventBlock){pendingEventBlock=0;nextConfirmAt=0;}
@@ -142,13 +174,12 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
           onHealthy?.();
         } catch (err) {
           catchupFailed=true;
-          const envioFailure=typeof err?.code==='string'&&err.code.startsWith('HYPERSYNC_');
-          log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':'INDEXER',reason:envioFailure?err.code:workerCode(err),delayMs:15000});
+          retryCatchup(err,'INDEXER');
           try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
           console.error('[CATCHUP_FAILED]', err?.message || err);
           log('alert', { code: 'CATCHUP_FAILED' });
         }
-        nextCatchupAt = Date.now() + (catchupFailed?15000:Math.max(15000,config.hypersyncReconcileMs??config.wsFallbackMs));
+        if(!catchupFailed)nextCatchupAt = Date.now() + Math.max(15000,config.hypersyncReconcileMs??config.wsFallbackMs);
       }
 
       if (!wsConnected && disconnectedAt && now - disconnectedAt >= config.alertStallMs && !disconnectAlerted) {
@@ -164,12 +195,12 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
           try {
             const cp = await writer.checkpoint();
             log('reconnect_scan', { from: cp.block_number, to: 'confirmed_head' });
-            await catchUp();
+            await catchUp('RECONNECT_RECOVERY');
+            envioFailures=0;nextRetryAt=0;
+            nextCatchupAt=Date.now()+Math.max(15000,config.hypersyncReconcileMs??config.wsFallbackMs);
           } catch (err) {
-            const envioFailure=typeof err?.code==='string'&&err.code.startsWith('HYPERSYNC_');
-            log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':'INDEXER',reason:envioFailure?err.code:workerCode(err),delayMs:15000});
+            retryCatchup(err,'INDEXER');
             try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
-            nextCatchupAt=Date.now()+15000;
             console.error('[RECONNECT_SCAN_FAILED]', err?.message || err);
             log('alert', { code: 'RECONNECT_SCAN_FAILED' });
           }
@@ -184,7 +215,7 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
         continue;
       }
 
-      const dueAt=nextConfirmAt?Math.min(nextCatchupAt,nextConfirmAt):nextCatchupAt;
+      const dueAt=Math.max(nextRetryAt,nextConfirmAt?Math.min(nextCatchupAt,nextConfirmAt):nextCatchupAt);
       const timeout = Math.min(60000,Math.max(1000,dueAt-Date.now()));
       const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
 
@@ -205,19 +236,11 @@ async function runLeader({config,session,pool,makeClient,makeLogSource,signal,lo
       }
       if (signalResult.blockNumber) {
         pendingEventBlock=Math.max(pendingEventBlock,Number(signalResult.blockNumber));
-        try {
-          await catchUp();
-          const latest=await writer.checkpoint();
-          if(Number(latest.block_number)>=pendingEventBlock){pendingEventBlock=0;nextConfirmAt=0;log('event_processed', { block: signalResult.blockNumber });}
-          else {nextConfirmAt=Date.now()+Math.max(5000,config.confirmations*1000);log('event_pending_confirmation',{block:signalResult.blockNumber});}
-        } catch (err) {
-          const envioFailure=typeof err?.code==='string'&&err.code.startsWith('HYPERSYNC_');
-          log('worker_status',{state:'RETRYING',component:envioFailure?'ENVIO':'INDEXER',reason:envioFailure?err.code:workerCode(err),delayMs:15000});
-          try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
-          nextCatchupAt=Date.now()+15000;
-          console.error('[EVENT_PROCESS_FAILED]', err?.message || err);
-          log('alert', { code: 'EVENT_PROCESS_FAILED' });
-        }
+        // A log notification is not permission to rescan an empty range. Wait
+        // the existing confirmation interval, then reconcile from the durable
+        // checkpoint; retry deadlines remain in force.
+        nextConfirmAt=Math.min(nextConfirmAt||Number.POSITIVE_INFINITY,Date.now()+Math.max(5000,config.confirmations*1000));
+        log('event_pending_confirmation',{block:signalResult.blockNumber});
       }
       onHealthy?.();
     }

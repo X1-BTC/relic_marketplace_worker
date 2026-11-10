@@ -4,6 +4,7 @@ import {marketplaceOnlyClient} from './marketplace-only-client.mjs';
 import {createCountingFetch,createRpcMetrics} from './rpc-metrics.mjs';
 import {runWorker} from './worker-loop.mjs';
 import {HyperSyncLogSource} from './hypersync-client.mjs';
+import {envioHyperRpcUrl,hybridReadClient} from './hybrid-rpc.mjs';
 import {PRODUCTION_CONFIG} from '../shared/production-config.mjs';
 
 // Closed log vocabulary: never pass error.message, stack, URL, env, manifest,
@@ -24,7 +25,11 @@ const fields=new Set([
   'wsMessagesIn','wsNotifications','eth_blockNumber','eth_chainId',
   'eth_getBlockByNumber','eth_getTransactionReceipt',
   'eth_getCode','eth_call',
+  'envioRpcCalls','envioRpcFailures','alchemyRpcCalls','alchemyEstimatedCu','alchemyUnpricedCalls',
+  'hypersyncRequests','hypersyncPages','hypersyncFailures','hypersyncRangeFailures','hypersyncRetries','hypersyncBlocksVerified','hypersyncLogs','hypersyncVerifiedBlocksPerSecond',
+  'heapUsedBytes','rssBytes','peakHeapUsedBytes','peakRssBytes',
   'state','component','reason',
+  'httpStatus','retryAfterMs','nextBlock','delayMs',
   // Ajouts pour les nouveaux événements
   'block','from','to'
 ]);
@@ -64,13 +69,23 @@ try {
     if(pg.types.getTypeParser(20)('9007199254740993')!=='9007199254740993'||pg.types.getTypeParser(1700)('100000000000000000025')!=='100000000000000000025')throw new WorkerFault('LOSSY_DATABASE_PARSER',{fatal:true});
     pool=createServerWriterPool({Pool:pg.Pool,connection:config.connection});
     const metrics=createRpcMetrics();
-    const makeClient=signal=>marketplaceOnlyClient(viem.createPublicClient({
-      chain:viem.defineChain({id:4663,name:'Robinhood Mainnet',nativeCurrency:{name:'RHBTC',symbol:'RHBTC',decimals:18},rpcUrls:{default:{http:[config.httpRpcUrl]}}}),
-      transport:viem.http(config.httpRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:createCountingFetch(metrics),fetchOptions:{signal}}),
-      cacheTime:0,
-    }),config.manifest,metrics);
-    const makeLogSource=signal=>new HyperSyncLogSource({apiToken:config.envioApiToken,signal,
-      onReady:()=>log('worker_status',{state:'ENVIO_READY',component:'ENVIO'})});
+    const chain=viem.defineChain({id:4663,name:'Robinhood Mainnet',nativeCurrency:{name:'RHBTC',symbol:'RHBTC',decimals:18},rpcUrls:{default:{http:[config.httpRpcUrl]}}});
+    const envioRpcUrl=envioHyperRpcUrl(config.envioApiToken);
+    const makeClient=signal=>{
+      const alchemy=marketplaceOnlyClient(viem.createPublicClient({
+        chain,transport:viem.http(config.httpRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:createCountingFetch(metrics),fetchOptions:{signal}}),cacheTime:0,
+      }),config.manifest,metrics);
+      const envio=marketplaceOnlyClient(viem.createPublicClient({
+        chain,transport:viem.http(envioRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchOptions:{signal}}),cacheTime:0,
+      }),config.manifest,metrics);
+      return hybridReadClient({alchemy,envio,metrics,onCapability:(method,state)=>{
+        if(state==='unsupported')log('worker_status',{state:'ENVIO_RPC_UNSUPPORTED',component:method});
+        else if(state==='unavailable')log('worker_status',{state:'RETRYING',component:'ENVIO_RPC',reason:method});
+      }});
+    };
+    const makeLogSource=signal=>new HyperSyncLogSource({apiToken:config.envioApiToken,signal,metrics,
+      onReady:()=>log('worker_status',{state:'ENVIO_READY',component:'ENVIO'}),
+      onRetry:info=>log('worker_status',{state:'RETRYING',component:'ENVIO',reason:info.code,attempt:info.attempt,delayMs:info.delayMs,httpStatus:info.httpStatus,retryAfterMs:info.retryAfterMs})});
     log('starting');
     await runWorker({config,pool,makeClient,makeLogSource,signal:stop.signal,log,onSession:value=>{session=value;},metrics});
   }

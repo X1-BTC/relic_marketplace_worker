@@ -503,8 +503,8 @@ export async function readBatch({
   integer(toBlock);
   const start = integer(Number(checkpoint.block_number));
 
-  if (toBlock <= start || toBlock - start > 1000) {
-    throw Error('Batch must contain 1–1000 blocks');
+  if (toBlock <= start || toBlock - start > 10000) {
+    throw Error('Batch must contain 1–10000 blocks');
   }
 
   const head = observedHead ?? await client.getBlockNumber();
@@ -513,16 +513,13 @@ export async function readBatch({
     throw Error('Unconfirmed batch');
   }
 
-  const anchor = observedAnchor ?? await client.getBlock({
-    blockNumber: BigInt(start)
-  });
+  const anchor = observedAnchor ?? null;
 
-  if (anchor.hash !== checkpoint.block_hash) {
+  if (anchor && anchor.hash !== checkpoint.block_hash) {
     throw Error('Reorg: recovery required');
   }
 
   const timestamps = new Map();
-  const endBefore = await client.getBlock({blockNumber:BigInt(toBlock)});
 
   if(!logSource||typeof logSource.getLogs!=='function')throw Error('Verified HyperSync source required');
   const fetched=await logSource.getLogs({address:addr(manifest.marketplace),fromBlock:start+1,toBlock:toBlock+1});
@@ -539,24 +536,24 @@ export async function readBatch({
 
   const eventBlockNumbers=[...new Set(logs.map(log=>integer(Number(log.blockNumber))))];
   if(eventBlockNumbers.some(number=>number<=start||number>toBlock))throw Error('Log outside checked range');
-  if(!eventBlockNumbers.includes(toBlock))eventBlockNumbers.push(toBlock);
   eventBlockNumbers.sort((a,b)=>a-b);
-  const blockMetadata=new Map([[toBlock,endBefore]]);
   const sourceHeaders=new Map(headers.map(h=>[h.number,h]));
-  if(sourceHeaders.get(toBlock)?.hash!==endBefore.hash)throw Error('HyperSync endpoint hash mismatch');
+  const blockMetadata=new Map();
   for(const number of eventBlockNumbers){
-    if(number===toBlock)continue;
     blockMetadata.set(number,await client.getBlock({blockNumber:BigInt(number)}));
   }
   for(const log of logs){
     if(sourceHeaders.get(Number(log.blockNumber))?.hash!==log.blockHash)throw Error('HyperSync log/header mismatch');
-    if(blockMetadata.get(Number(log.blockNumber))?.hash!==log.blockHash)throw Error('Log block hash mismatch');
+    const canonical=blockMetadata.get(Number(log.blockNumber))??sourceHeaders.get(Number(log.blockNumber));
+    if(canonical?.hash!==log.blockHash)throw Error('Log block hash mismatch');
   }
   for(const guard of fetched.rollbackGuards){
     if(guard.firstBlockNumber===start+1&&guard.firstParentHash!==checkpoint.block_hash)throw Error('Reorg at verified range boundary');
-    const known=blockMetadata.get(guard.blockNumber);
-    const canonical=known??await client.getBlock({blockNumber:BigInt(guard.blockNumber)});
-    if(canonical.hash!==guard.hash)throw Error('HyperSync rollback guard mismatch');
+    // Every guard is required to fall inside its returned page. The full
+    // parent-linked page is anchored by the checked checkpoint and the
+    // canonical endpoint below, so no separate RPC header read is needed.
+    const canonical=sourceHeaders.get(guard.blockNumber);
+    if(!canonical||canonical.hash!==guard.hash)throw Error('HyperSync rollback guard mismatch');
   }
   for(const [number,block] of blockMetadata)if(block.timestamp!==undefined)timestamps.set(number,new Date(Number(block.timestamp)*1000).toISOString());
 
@@ -608,11 +605,14 @@ export async function readBatch({
     throw Error('Log/receipt mismatch');
   }
 
-  // A canonical end-block hash commits to every parent.
-  const canonicalStart=await client.getBlock({blockNumber:BigInt(start)});
-  if(canonicalStart.hash!==checkpoint.block_hash)throw Error('Reorg during collection');
+  // The checkpoint boundary was checked before collection. HyperSync supplied
+  // a contiguous parent-linked range from that boundary; one canonical endpoint
+  // read after receipt verification anchors the whole range without rereading
+  // both endpoints before and after every empty batch.
   const canonicalEnd = await client.getBlock({blockNumber:BigInt(toBlock)});
-  if(canonicalEnd.hash!==endBefore.hash)throw Error('Reorg during collection');
+  if(canonicalEnd.hash!==sourceHeaders.get(toBlock)?.hash)throw Error('HyperSync endpoint hash mismatch');
+  blockMetadata.set(toBlock,canonicalEnd);
+  if(canonicalEnd.timestamp!==undefined)timestamps.set(toBlock,new Date(Number(canonicalEnd.timestamp)*1000).toISOString());
 
   // Verify runtime bytecode and PRINTER decimals before SQL commit.
   if (verifyContracts) await verifyChain(client, manifest, toBlock);

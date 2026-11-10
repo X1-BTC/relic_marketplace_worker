@@ -197,10 +197,10 @@ export class PostgresMarketplaceWriter {
       const cp=await this.locked(db,input.expectedVersion);
       const start=Number(cp.block_number);
       if(start<SNAPSHOT_BLOCK) throw Error('Checkpoint precedes protected snapshot');
-      if(!input.range||input.range.fromBlock!==start+1||!Number.isSafeInteger(input.range.toBlock)||input.range.toBlock<=start||input.range.toBlock-start>1000)throw Error('Invalid checked block range');
+      if(!input.range||input.range.fromBlock!==start+1||!Number.isSafeInteger(input.range.toBlock)||input.range.toBlock<=start||input.range.toBlock-start>10000)throw Error('Invalid checked block range');
       const number=input.range.toBlock;
       await this.registry(db,start+1);
-      if (!input.blocks?.length || input.blocks.length > 1000) throw Error('Invalid sparse block journal');
+      if (!input.blocks?.length || input.blocks.length > 10000) throw Error('Invalid sparse block journal');
       const hashes=new Map();
       for (const b of input.blocks) {
         integer(b.number); hash(b.hash); hash(b.parentHash);

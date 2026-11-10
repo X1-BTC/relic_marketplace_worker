@@ -52,6 +52,7 @@ export function readWorkerConfig(env) {
     envioApiToken:required(env,'ENVIO_API_TOKEN'),
     pollMs:number(env,'RM_POLL_INTERVAL_MS',60000,15000,300000),
     batchSize:number(env,'RM_BATCH_SIZE',10,1,100),
+    hypersyncRangeBlocks:number(env,'RM_HYPERSYNC_RANGE_BLOCKS',10000,1000,10000),
     confirmations:number(env,'RM_CONFIRMATIONS',12,1,1000),
     wsFallbackMs:number(env,'RM_WS_FALLBACK_INTERVAL_MS',300000,30000,1800000),
     hypersyncReconcileMs:number(env,'RM_HYPERSYNC_RECONCILE_INTERVAL_MS',300000,30000,1800000),
