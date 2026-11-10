@@ -3,7 +3,7 @@ import {sharedHyperSyncScheduler} from '../indexer/hypersync-scheduler.mjs';
 import {decode,manifestDigest,validateManifest,readBatch,project,normalizeLog,eventKey,json} from '../indexer/marketplace.mjs';
 import {businessRows} from '../indexer/business-tables.mjs';
 import {marketplaceOnlyClient} from '../indexer/marketplace-only-client.mjs';
-import {envioHyperRpcUrl,hybridReadClient,createRpcStatusFetch} from '../indexer/hybrid-rpc.mjs';
+import {RpcFallbackScheduler,createAlchemyReadClient,createRpcStatusFetch} from '../indexer/hybrid-rpc.mjs';
 import {pathToFileURL} from 'node:url';
 
 const DEPLOYMENT_BLOCK=99_777_330;
@@ -162,10 +162,9 @@ async function runFull(){
   }});
   const viem=await import('viem');
   const chain=viem.defineChain({id:4663,name:'Robinhood Mainnet',nativeCurrency:{name:'RHBTC',symbol:'RHBTC',decimals:18},rpcUrls:{default:{http:[config.alchemyUrl]}}});
-  const envioFetch=createRpcStatusFetch();
-  const envio=viem.createPublicClient({chain,transport:viem.http(envioHyperRpcUrl(config.token),{retryCount:0,timeout:15000,batch:false,fetchFn:envioFetch}),cacheTime:0});
-  const alchemy=viem.createPublicClient({chain,transport:viem.http(config.alchemyUrl,{retryCount:0,timeout:15000,batch:false}),cacheTime:0});
-  const client=marketplaceOnlyClient(hybridReadClient({envio,alchemy,rpcFacts:envioFetch.facts}),config.manifest);
+  const alchemyFetch=createRpcStatusFetch();
+  const alchemy=viem.createPublicClient({chain,transport:viem.http(config.alchemyUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:alchemyFetch}),cacheTime:0});
+  const client=marketplaceOnlyClient(createAlchemyReadClient(alchemy,{scheduler:new RpcFallbackScheduler()}),config.manifest);
   try{
     const checkpoint=await readOnly(pool,async db=>{
       const result=await db.query(`SELECT stream,chain_id,anchor_number,anchor_hash,block_number,block_hash,version,manifest_digest,manifest
@@ -217,7 +216,7 @@ async function runFull(){
     for(const row of projectionRows.relic_market_settlements)settlementStates[row.reconcile_status]=(settlementStates[row.reconcile_status]??0)+1;
     out('audit_summary',{stream:config.stream,fromBlock:DEPLOYMENT_BLOCK,toBlockInclusive:Number(checkpoint.block_number),checkpointVersion:String(checkpoint.version),ranges:rangeCount,hyperSyncRequests:metrics.requests,hyperSyncPages:metrics.pages,hyperSyncRetries:metrics.retries,hyperSyncFailures:metrics.failures,blocksHeaderLinked:metrics.verifiedBlocks,logs:metrics.logs,countsByType,missingJournalOrRaw:missingEventIdentities,eventsWithAnyMissingProjection:missing.length,businessMissing,receiptVerifiedRelevantLogs:orderedReceipts.length,projectedSettlementStates:settlementStates,projectedPaymentTransfers:projectionRows.relic_market_payment_transfers.length,canonical:{fullParentLinkedHeaderSequence:true,sequenceAnchoredToStoredCheckpointHash:true,independentRpcComparison:false,receiptVerification:true},databaseWrites:0});
     for(const row of missing)out('audit_missing',row);
-    out('audit_uncertainty',{receiptVerification:'Every MarketplaceV3 transaction receipt was checked for success, block/transaction identity, exact proxy log identity, and receipt-backed authorized NFT/PRINTER logs; existing projection and settlement logic was applied.',canonicalValidation:'HyperSync headers were parent-linked across pages/ranges; event blocks and each range endpoint were checked through the HyperRPC-preferred canonical read client; the final header matched the stored checkpoint hash. This is not an independent provider comparison unless Alchemy fallback was used.',replay:'Audit only; no rows or checkpoints were changed.'});
+    out('audit_uncertainty',{receiptVerification:'Every MarketplaceV3 transaction receipt was checked for success, block/transaction identity, exact proxy log identity, and receipt-backed authorized NFT/PRINTER logs; existing projection and settlement logic was applied.',canonicalValidation:'HyperSync headers were parent-linked across pages/ranges; event blocks and each range endpoint were checked through the Alchemy canonical read client; the final header matched the stored checkpoint hash. HyperSync and Alchemy are separate providers.',replay:'Audit only; no rows or checkpoints were changed.'});
   }finally{await pool.end();}
 }
 

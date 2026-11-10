@@ -1,11 +1,3 @@
-const unsupportedMethod=error=>{
-  for(let current=error;current;current=current.cause){
-    if(current.code===-32601||current.code==='METHOD_NOT_FOUND')return true;
-    if(/method (?:not found|not supported|does not exist)|unsupported method/i.test(String(current.shortMessage??current.message??'')))return true;
-  }
-  return false;
-};
-
 export class RpcFallbackScheduler {
   constructor({limit=10,windowMs=60000,now=Date.now,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}){
     if(!Number.isInteger(limit)||limit<1||!Number.isFinite(windowMs)||windowMs<1)throw Error('Invalid RPC fallback bounds');
@@ -24,52 +16,20 @@ export class RpcFallbackScheduler {
 }
 const defaultFallbackScheduler=new RpcFallbackScheduler();
 
-// HyperRPC is preferred for documented block and transaction reads. Any
-// provider failure falls back to the rate-limited Alchemy read path; repeated
-// failures are cooled down so an invalid HyperRPC token cannot stall indexing.
-export function hybridReadClient({alchemy,envio,metrics={},onCapability=()=>{},now=Date.now,retryMs=60000,fallbackScheduler=defaultFallbackScheduler,rpcFacts=()=>({})}) {
-  const methods=new Map();
-  const run=async(method,args,envioRead,alchemyRead)=>{
-    const state=methods.get(method);
-    if(state?.unsupported)return fallback(method,args,alchemyRead);
-    if(state?.unavailableUntil>now())return fallback(method,args,alchemyRead);
-    try{
-      const result=await envioRead(args);
-      methods.set(method,{unsupported:false,unavailableUntil:0});
-      metrics.providerAction?.(method,'envio');
-      if(state?.unsupported!==false||state?.unavailableUntil)onCapability(method,'ready');
-      return result;
-    }catch(error){
-      const unsupported=unsupportedMethod(error);
-      methods.set(method,unsupported?{unsupported:true,unavailableUntil:0}:{unsupported:false,unavailableUntil:now()+retryMs});
-      metrics.providerAction?.(method,'envioFailure');
-      onCapability(method,unsupported?'unsupported':'unavailable',rpcFacts());
-      // HyperRPC is optional for these read-only methods. An auth, network, or
-      // provider failure falls back to the existing Alchemy HTTP client so a
-      // bad HyperRPC token cannot stall checkpointing. Calls through this path
-      // are globally throttled; after a failure we skip HyperRPC for retryMs.
-      return fallback(method,args,alchemyRead);
-    }
-  };
-  const fallback=async(method,args,read)=>{
-    return fallbackScheduler.request(async()=>{
-      metrics.providerAction?.(method,'alchemy');
-      try{return await read(args);}catch{throw Object.assign(new Error('RPC_READ_FAILED'),{code:'RPC_READ_FAILED'});}
-    });
-  };
+// Canonical reads always use Alchemy and share one bounded request scheduler.
+export function createAlchemyReadClient(alchemy,{metrics={},scheduler=defaultFallbackScheduler}={}) {
+  const read=(method,fn)=>args=>scheduler.request(async()=>{
+    metrics.providerAction?.(method,'alchemy');
+    try{return await fn(args);}catch{throw Object.assign(new Error('RPC_READ_FAILED'),{code:'RPC_READ_FAILED'});}
+  });
   return {
-    getBlockNumber:args=>run('eth_blockNumber',args??{cacheTime:0},envio.getBlockNumber.bind(envio),alchemy.getBlockNumber.bind(alchemy)),
-    getBlock:args=>run('eth_getBlockByNumber',args,envio.getBlock.bind(envio),alchemy.getBlock.bind(alchemy)),
-    getTransactionReceipt:args=>run('eth_getTransactionReceipt',args,envio.getTransactionReceipt.bind(envio),alchemy.getTransactionReceipt.bind(alchemy)),
-    getChainId:args=>fallback('eth_chainId',args,alchemy.getChainId.bind(alchemy)),
-    getBytecode:args=>fallback('eth_getCode',args,alchemy.getBytecode.bind(alchemy)),
-    readContract:args=>fallback('eth_call',args,alchemy.readContract.bind(alchemy)),
+    getBlockNumber:read('eth_blockNumber',()=>alchemy.getBlockNumber()),
+    getBlock:read('eth_getBlockByNumber',args=>alchemy.getBlock(args)),
+    getTransactionReceipt:read('eth_getTransactionReceipt',args=>alchemy.getTransactionReceipt(args)),
+    getChainId:read('eth_chainId',()=>alchemy.getChainId()),
+    getBytecode:read('eth_getCode',args=>alchemy.getBytecode(args)),
+    readContract:read('eth_call',args=>alchemy.readContract(args)),
   };
-}
-
-export function envioHyperRpcUrl(apiToken) {
-  if(typeof apiToken!=='string'||!apiToken.trim())throw Error('ENVIO_TOKEN_REQUIRED');
-  return `https://4663.rpc.hypersync.xyz/${encodeURIComponent(apiToken)}`;
 }
 
 // Capture only transport status and JSON-RPC numeric error code. Never log or

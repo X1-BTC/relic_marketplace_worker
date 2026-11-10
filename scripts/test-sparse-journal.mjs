@@ -6,7 +6,7 @@ import {businessRows,rawRow} from '../indexer/business-tables.mjs';
 import {PostgresMarketplaceWriter} from '../indexer/postgres-writer.mjs';
 import {HyperSyncLogSource} from '../indexer/hypersync-client.mjs';
 import {HyperSyncRequestScheduler} from '../indexer/hypersync-scheduler.mjs';
-import {envioHyperRpcUrl,hybridReadClient,createRpcStatusFetch,RpcFallbackScheduler} from '../indexer/hybrid-rpc.mjs';
+import {createAlchemyReadClient,createRpcStatusFetch,RpcFallbackScheduler} from '../indexer/hybrid-rpc.mjs';
 import {indexOnce} from '../indexer/run-once.mjs';
 import {checkpointBehindConfirmedHead} from '../indexer/worker-loop.mjs';
 
@@ -100,43 +100,23 @@ assert.equal(checkpointBehindConfirmedHead(121,108,12),true,'only a confirmed ga
   assert.equal(rows.relic_market_payment_transfers.length,2);
 }
 
-// HyperRPC handles supported block and receipt methods; unsupported or failed
-// reads fall back through a bounded Alchemy path and retain safe status data.
+// Canonical, receipt, contract and checkpoint reads use the bounded Alchemy path.
 {
-  const calls={envio:[],alchemy:[]};
-  const make=(side,failures={})=>Object.fromEntries(['getBlockNumber','getBlock','getTransactionReceipt','getChainId','getBytecode','readContract'].map(name=>[name,async args=>{
-    calls[side].push(name);
-    if(failures[name])throw failures[name];
-    return `${side}:${name}`;
+  const calls=[];
+  const alchemy=Object.fromEntries(['getBlockNumber','getBlock','getTransactionReceipt','getChainId','getBytecode','readContract'].map(name=>[name,async args=>{
+    calls.push({name,args});return `alchemy:${name}`;
   }]));
-  const rpc=hybridReadClient({envio:make('envio'),alchemy:make('alchemy')});
-  assert.equal(await rpc.getBlockNumber(),'envio:getBlockNumber');
-  assert.equal(await rpc.getBlock({blockNumber:1n}),'envio:getBlock');
-  assert.equal(await rpc.getTransactionReceipt({hash:'0x01'}),'envio:getTransactionReceipt');
-  assert.equal(calls.alchemy.length,0,'supported HyperRPC reads do not use Alchemy');
+  const direct={async request(task){return task();}};
+  const rpc=createAlchemyReadClient(alchemy,{scheduler:direct});
+  assert.equal(await rpc.getBlockNumber(),'alchemy:getBlockNumber');
+  assert.equal(await rpc.getBlock({blockNumber:1n}),'alchemy:getBlock');
+  assert.equal(await rpc.getTransactionReceipt({hash:'0x01'}),'alchemy:getTransactionReceipt');
   assert.equal(await rpc.getChainId(),'alchemy:getChainId');
   assert.equal(await rpc.getBytecode({address:'0x01'}),'alchemy:getBytecode');
   assert.equal(await rpc.readContract({address:'0x01'}),'alchemy:readContract');
-
-  const unsupported=Object.assign(new Error('method not found'),{code:-32601});
-  const directFallback={async request(task){return task();}};
-  const fallback=hybridReadClient({envio:make('envio',{getBlockNumber:unsupported}),alchemy:make('alchemy'),fallbackScheduler:directFallback});
-  assert.equal(await fallback.getBlockNumber(),'alchemy:getBlockNumber');
-  assert.equal(await fallback.getBlockNumber(),'alchemy:getBlockNumber');
-  assert.equal(calls.envio.filter(name=>name==='getBlockNumber').length,2,'unsupported capability is cached after first failure');
-
-  const transient=hybridReadClient({envio:make('envio',{getBlockNumber:new Error('temporary failure')}),alchemy:make('alchemy'),fallbackScheduler:directFallback});
-  assert.equal(await transient.getBlockNumber(),'alchemy:getBlockNumber','transient HyperRPC failures fail over to Alchemy');
-  assert.equal(await transient.getBlockNumber(),'alchemy:getBlockNumber','the cooldown avoids a rapid retry loop against HyperRPC');
-  assert.equal(calls.envio.filter(name=>name==='getBlockNumber').length,3,'unsupported is cached while a transient outage is retried only after its cooldown');
-  assert.equal(calls.alchemy.filter(name=>name==='getBlockNumber').length,4,'each failed or cooling-down read uses Alchemy');
-  let reported=null;
-  const authFailure=hybridReadClient({envio:make('envio',{getBlockNumber:Object.assign(new Error('unauthorized'),{status:401})}),
-    alchemy:make('alchemy'),fallbackScheduler:directFallback,rpcFacts:()=>({httpStatus:401,jsonRpcCode:-32001}),
-    onCapability:(method,state,facts)=>{if(state==='unavailable')reported={method,...facts};}});
-  assert.equal(await authFailure.getBlockNumber(),'alchemy:getBlockNumber','HyperRPC authorization failure does not stop indexing');
-  assert.deepEqual(reported,{method:'eth_blockNumber',httpStatus:401,jsonRpcCode:-32001});
-  assert.equal(envioHyperRpcUrl('token/a'),'https://4663.rpc.hypersync.xyz/token%2Fa');
+  assert.deepEqual(calls.map(x=>x.name),['getBlockNumber','getBlock','getTransactionReceipt','getChainId','getBytecode','readContract']);
+  const failing=createAlchemyReadClient({...alchemy,async getBlockNumber(){throw Error('private transport details');}},{scheduler:direct});
+  await assert.rejects(failing.getBlockNumber(),error=>error.code==='RPC_READ_FAILED'&&error.message==='RPC_READ_FAILED');
 
   const clock={time:0};let fallbackCalls=0;
   const limiter=new RpcFallbackScheduler({limit:10,windowMs:60000,now:()=>clock.time,sleep:async ms=>{clock.time+=ms;}});
@@ -451,4 +431,4 @@ function rpc({logs=[],orphan=false}={}){
   assert.ok(rollbackSql.some(sql=>sql.includes('DELETE FROM relic_market_indexer.blocks')),'sparse and legacy dense descendants are removed atomically');
 }
 
-console.log('Marketplace indexer focused checks passed: historical transitions, receipt settlements, HyperRPC fallback, replay checkpoint safety, empty ranges, bounded recovery and reorg rollback.');
+console.log('Marketplace indexer focused checks passed: historical transitions, receipt settlements, Alchemy RPC scheduling, replay checkpoint safety, empty ranges, bounded recovery and reorg rollback.');
