@@ -246,6 +246,53 @@ export class PostgresMarketplaceWriter {
       return {blockNumber:number,blockHash:parent,version:nextVersion,state};
     });
   }
+  // Historical repair is deliberately separate from commit(): it may add
+  // receipt-verified events below the live checkpoint, but must never move the
+  // checkpoint, volume watermark, or replace existing canonical evidence.
+  async replayHistorical(batch) {
+    const input=copy(batch);
+    return this.transaction(async db=>{
+      const cp=await this.locked(db,input.expectedVersion);
+      const from=Number(input.range?.fromBlock),to=Number(input.range?.toBlock);
+      if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to)||from<=SNAPSHOT_BLOCK||to<from||to>Number(cp.block_number)||to-from>=10000)throw Error('Invalid historical replay range');
+      await this.registry(db,from);
+      if(!Array.isArray(input.blocks)||!input.blocks.length||!Array.isArray(input.events))throw Error('Invalid historical replay journal');
+      const hashes=new Map();
+      for(const b of input.blocks){integer(b.number);hash(b.hash);hash(b.parentHash);if(b.number<from||b.number>to||hashes.has(b.number))throw Error('Invalid historical replay block');hashes.set(b.number,b.hash);}
+      if(!hashes.has(to))throw Error('Historical replay endpoint missing');
+      const unique=new Map();
+      for(const raw of input.events){const e=normalizeLog(raw),key=eventKey(e);if(e.blockNumber<from||e.blockNumber>to||hashes.get(e.blockNumber)!==e.blockHash)throw Error('Historical replay event outside canonical range');if(unique.has(key)&&json(unique.get(key))!==json(e))throw Error('Conflicting historical replay duplicate');unique.set(key,e);}
+      const ordered=[...unique.values()].sort((a,b)=>a.blockNumber-b.blockNumber||a.logIndex-b.logIndex);
+      for(const b of [...input.blocks].sort((a,c)=>a.number-c.number)){
+        await db.query('INSERT INTO relic_market_indexer.blocks(stream,block_number,block_hash,parent_hash) VALUES($1,$2,$3,$4) ON CONFLICT(stream,block_number) DO NOTHING',[this.stream,b.number,b.hash,b.parentHash]);
+        const saved=await db.query('SELECT block_hash,parent_hash FROM relic_market_indexer.blocks WHERE stream=$1 AND block_number=$2',[this.stream,b.number]);
+        if(saved.rows.length!==1||saved.rows[0].block_hash!==b.hash||saved.rows[0].parent_hash!==b.parentHash)throw Error('Historical replay canonical anchor conflict');
+      }
+      const {rows:maxRows}=await db.query('SELECT max(block_number) AS block_number FROM relic_market_indexer.events WHERE stream=$1',[this.stream]);
+      let latest=maxRows[0]?.block_number==null?null:Number(maxRows[0].block_number);
+      const eventsByBlock=new Map();
+      for(const e of ordered){const group=eventsByBlock.get(e.blockNumber)??[];group.push(e);eventsByBlock.set(e.blockNumber,group);}
+      for(const [number,events] of eventsByBlock){
+        const existing=await db.query('SELECT count(*)::text AS count FROM relic_market_indexer.events WHERE stream=$1 AND block_number=$2',[this.stream,number]);
+        const priorCount=Number(existing.rows[0]?.count??0);
+        if(priorCount){
+          if(priorCount!==events.length)throw Error('Historical replay found partially indexed event block');
+          for(const e of events)await this.ingest(db,e); // validates ownership and byte-for-byte identity
+          continue;
+        }
+        if(latest!==null&&number<=latest)throw Error('Historical replay would insert before existing journal history');
+        for(const e of events)await this.ingest(db,e);
+        const refs=entityReferences(events,this.manifest);
+        const seed=await this.captureEntityUndo(db,number,refs);
+        let projected,rows;
+        try{projected=project(events,this.manifest,seed);}catch(error){error.indexerReason=`Historical replay projection: ${String(error.message).slice(0,120)}`;throw error;}
+        try{rows=businessRows(events,projected,this.manifest,this.stream);}catch(error){error.indexerReason=`Historical replay mapping: ${String(error.message).slice(0,120)}`;throw error;}
+        for(const table of ['relic_market_activity','relic_market_config_events','relic_market_listings','relic_market_offers','relic_market_settlements','relic_market_payment_transfers'])for(const row of rows[table])await upsertBusinessRow(db,table,row,this.stream);
+        latest=number;
+      }
+      return {unchangedCheckpoint:true,blockNumber:Number(cp.block_number),version:String(cp.version),replayedBlocks:eventsByBlock.size,replayedEvents:ordered.length};
+    });
+  }
   async recover({client,expectedVersion}) {
     return this.transaction(async db=>{
       const cp=await this.locked(db,expectedVersion);

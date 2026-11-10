@@ -491,6 +491,7 @@ export async function readBatch({
   head: observedHead = null,
   anchor: observedAnchor = null,
   logSource = null,
+  verifiedLogs = null,
   verifyContracts = true
 }) {
   validateManifest(manifest);
@@ -521,8 +522,9 @@ export async function readBatch({
 
   const timestamps = new Map();
 
-  if(!logSource||typeof logSource.getLogs!=='function')throw Error('Verified HyperSync source required');
-  const fetched=await logSource.getLogs({address:addr(manifest.marketplace),fromBlock:start+1,toBlock:toBlock+1});
+  if(verifiedLogs!==null&&(!Array.isArray(verifiedLogs.logs)||!Array.isArray(verifiedLogs.headers)||!Array.isArray(verifiedLogs.rollbackGuards)))throw Error('Invalid pre-fetched verified logs');
+  if(verifiedLogs===null&&(!logSource||typeof logSource.getLogs!=='function'))throw Error('Verified HyperSync source required');
+  const fetched=verifiedLogs??await logSource.getLogs({address:addr(manifest.marketplace),fromBlock:start+1,toBlock:toBlock+1});
   const logs=fetched.logs;
   if(!Array.isArray(logs)||!Array.isArray(fetched.rollbackGuards))throw Error('Invalid verified log source response');
   for(const log of logs)if(addr(log.address)!==addr(manifest.marketplace))throw Error('Log source returned a non-proxy address');

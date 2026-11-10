@@ -4,7 +4,7 @@ import {marketplaceOnlyClient} from './marketplace-only-client.mjs';
 import {createCountingFetch,createRpcMetrics} from './rpc-metrics.mjs';
 import {runWorker} from './worker-loop.mjs';
 import {HyperSyncLogSource} from './hypersync-client.mjs';
-import {envioHyperRpcUrl,hybridReadClient} from './hybrid-rpc.mjs';
+import {envioHyperRpcUrl,hybridReadClient,createRpcStatusFetch} from './hybrid-rpc.mjs';
 import {PRODUCTION_CONFIG} from '../shared/production-config.mjs';
 
 // Closed log vocabulary: never pass error.message, stack, URL, env, manifest,
@@ -29,7 +29,7 @@ const fields=new Set([
   'hypersyncRequests','hypersyncPages','hypersyncFailures','hypersyncRangeFailures','hypersyncRetries','hypersyncBlocksVerified','hypersyncLogs','hypersyncVerifiedBlocksPerSecond',
   'heapUsedBytes','rssBytes','peakHeapUsedBytes','peakRssBytes',
   'state','component','reason',
-  'httpStatus','retryAfterMs','nextBlock','delayMs',
+  'httpStatus','jsonRpcCode','retryAfterMs','nextBlock','delayMs',
   // Ajouts pour les nouveaux événements
   'block','from','to'
 ]);
@@ -72,15 +72,16 @@ try {
     const chain=viem.defineChain({id:4663,name:'Robinhood Mainnet',nativeCurrency:{name:'RHBTC',symbol:'RHBTC',decimals:18},rpcUrls:{default:{http:[config.httpRpcUrl]}}});
     const envioRpcUrl=envioHyperRpcUrl(config.envioApiToken);
     const makeClient=signal=>{
+      const envioFetch=createRpcStatusFetch();
       const alchemy=marketplaceOnlyClient(viem.createPublicClient({
         chain,transport:viem.http(config.httpRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:createCountingFetch(metrics),fetchOptions:{signal}}),cacheTime:0,
       }),config.manifest,metrics);
       const envio=marketplaceOnlyClient(viem.createPublicClient({
-        chain,transport:viem.http(envioRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchOptions:{signal}}),cacheTime:0,
+        chain,transport:viem.http(envioRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:envioFetch,fetchOptions:{signal}}),cacheTime:0,
       }),config.manifest,metrics);
-      return hybridReadClient({alchemy,envio,metrics,onCapability:(method,state)=>{
+      return hybridReadClient({alchemy,envio,metrics,rpcFacts:envioFetch.facts,onCapability:(method,state,facts)=>{
         if(state==='unsupported')log('worker_status',{state:'ENVIO_RPC_UNSUPPORTED',component:method});
-        else if(state==='unavailable')log('worker_status',{state:'RETRYING',component:'ENVIO_RPC',reason:method});
+        else if(state==='unavailable')log('worker_status',{state:'ENVIO_RPC_UNAVAILABLE',component:method,httpStatus:facts?.httpStatus,jsonRpcCode:facts?.jsonRpcCode});
       }});
     };
     const makeLogSource=signal=>new HyperSyncLogSource({apiToken:config.envioApiToken,signal,metrics,
