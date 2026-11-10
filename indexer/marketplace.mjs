@@ -480,68 +480,8 @@ export async function verifyChain(client, manifest, blockNumber) {
   }
 }
 
-// Robinhood Mainnet's Alchemy eth_getLogs range is limited to ten inclusive
-// blocks. Keep the cap here, at the only reader used by normal catch-up and
-// restart paths, so a larger worker batch cannot exceed the provider limit.
-export const MAX_ETH_GET_LOGS_BLOCKS = 10;
-
-export async function getLogsInRanges({ client, address, fromBlock, toBlock }) {
-  const from = typeof fromBlock === 'bigint'
-    ? fromBlock
-    : BigInt(integer(fromBlock));
-
-  const to = typeof toBlock === 'bigint'
-    ? toBlock
-    : BigInt(integer(toBlock));
-
-  if (from < 0n || to < 0n) {
-    throw Error('Invalid eth_getLogs range');
-  }
-
-  if (from > to) return [];
-
-  const unique = new Map();
-
-  for (let first = from; first <= to;) {
-    const last = to < first + BigInt(MAX_ETH_GET_LOGS_BLOCKS - 1)
-      ? to
-      : first + BigInt(MAX_ETH_GET_LOGS_BLOCKS - 1);
-
-    const page = await client.getLogs({
-      address,
-      fromBlock: first,
-      toBlock: last
-    });
-
-    if (!Array.isArray(page)) {
-      throw Error('Invalid eth_getLogs response');
-    }
-
-    for (const log of page) {
-      const normalized = normalizeLog(log);
-      const key = eventKey(normalized);
-      const serialized = json(normalized);
-      const prior = unique.get(key);
-
-      if (prior && prior.serialized !== serialized) {
-        throw Error('Conflicting duplicate eth_getLogs log');
-      }
-
-      if (!prior) {
-        unique.set(key, { log, normalized, serialized });
-      }
-    }
-
-    first = last + 1n;
-  }
-
-  return [...unique.values()]
-    .sort((a, b) => order(a.normalized, b.normalized))
-    .map(item => item.log);
-}
-
-// Reader is a viem public client backed by same-origin /rpc. This module has no
-// provider, credentials, environment lookup, signing, SQL connection or scheduler.
+// The caller supplies verified HyperSync results and an Alchemy read client for
+// canonical headers, receipts, and the existing contract integrity checks.
 export async function readBatch({
   client,
   manifest,
@@ -550,6 +490,7 @@ export async function readBatch({
   confirmations = 12,
   head: observedHead = null,
   anchor: observedAnchor = null,
+  logSource = null,
   verifyContracts = true
 }) {
   validateManifest(manifest);
@@ -580,41 +521,44 @@ export async function readBatch({
     throw Error('Reorg: recovery required');
   }
 
-  const blocks = [];
   const timestamps = new Map();
-  let parent = anchor.hash;
+  const endBefore = await client.getBlock({blockNumber:BigInt(toBlock)});
 
-  for (let n = start + 1; n <= toBlock; n++) {
-    const b = await client.getBlock({
-      blockNumber: BigInt(n)
-    });
-
-    if (b.parentHash !== parent) {
-      throw Error('Reorg during collection');
-    }
-
-    blocks.push({
-      number: n,
-      hash: b.hash,
-      parentHash: b.parentHash
-    });
-
-    parent = b.hash;
-
-    if (b.timestamp !== undefined) {
-      timestamps.set(
-        n,
-        new Date(Number(b.timestamp) * 1000).toISOString()
-      );
-    }
+  if(!logSource||typeof logSource.getLogs!=='function')throw Error('Verified HyperSync source required');
+  const fetched=await logSource.getLogs({address:addr(manifest.marketplace),fromBlock:start+1,toBlock:toBlock+1});
+  const logs=fetched.logs;
+  if(!Array.isArray(logs)||!Array.isArray(fetched.rollbackGuards))throw Error('Invalid verified log source response');
+  for(const log of logs)if(addr(log.address)!==addr(manifest.marketplace))throw Error('Log source returned a non-proxy address');
+  const headers=fetched.headers;
+  if(!Array.isArray(headers)||headers.length!==toBlock-start)throw Error('HyperSync block coverage incomplete');
+  for(let i=0;i<headers.length;i++){
+    const h=headers[i];
+    if(h.number!==start+1+i||!hash(h.hash)||!hash(h.parentHash)||(i&&h.parentHash!==headers[i-1].hash))throw Error('HyperSync canonical range invalid');
   }
+  if(headers[0].parentHash!==checkpoint.block_hash)throw Error('Reorg at verified range boundary');
 
-  const logs = await getLogsInRanges({
-    client,
-    address: [manifest.marketplace, manifest.printer, manifest.nft].map(addr),
-    fromBlock: start + 1,
-    toBlock
-  });
+  const eventBlockNumbers=[...new Set(logs.map(log=>integer(Number(log.blockNumber))))];
+  if(eventBlockNumbers.some(number=>number<=start||number>toBlock))throw Error('Log outside checked range');
+  if(!eventBlockNumbers.includes(toBlock))eventBlockNumbers.push(toBlock);
+  eventBlockNumbers.sort((a,b)=>a-b);
+  const blockMetadata=new Map([[toBlock,endBefore]]);
+  const sourceHeaders=new Map(headers.map(h=>[h.number,h]));
+  if(sourceHeaders.get(toBlock)?.hash!==endBefore.hash)throw Error('HyperSync endpoint hash mismatch');
+  for(const number of eventBlockNumbers){
+    if(number===toBlock)continue;
+    blockMetadata.set(number,await client.getBlock({blockNumber:BigInt(number)}));
+  }
+  for(const log of logs){
+    if(sourceHeaders.get(Number(log.blockNumber))?.hash!==log.blockHash)throw Error('HyperSync log/header mismatch');
+    if(blockMetadata.get(Number(log.blockNumber))?.hash!==log.blockHash)throw Error('Log block hash mismatch');
+  }
+  for(const guard of fetched.rollbackGuards){
+    if(guard.firstBlockNumber===start+1&&guard.firstParentHash!==checkpoint.block_hash)throw Error('Reorg at verified range boundary');
+    const known=blockMetadata.get(guard.blockNumber);
+    const canonical=known??await client.getBlock({blockNumber:BigInt(guard.blockNumber)});
+    if(canonical.hash!==guard.hash)throw Error('HyperSync rollback guard mismatch');
+  }
+  for(const [number,block] of blockMetadata)if(block.timestamp!==undefined)timestamps.set(number,new Date(Number(block.timestamp)*1000).toISOString());
 
   const txs = new Set(logs.map(l => l.transactionHash));
   const receipts = [];
@@ -665,20 +609,20 @@ export async function readBatch({
   }
 
   // A canonical end-block hash commits to every parent.
-  const canonicalEnd = await client.getBlock({
-    blockNumber: BigInt(toBlock)
-  });
-
-  if (canonicalEnd.hash !== blocks.at(-1)?.hash) {
-    throw Error('Reorg during collection');
-  }
+  const canonicalStart=await client.getBlock({blockNumber:BigInt(start)});
+  if(canonicalStart.hash!==checkpoint.block_hash)throw Error('Reorg during collection');
+  const canonicalEnd = await client.getBlock({blockNumber:BigInt(toBlock)});
+  if(canonicalEnd.hash!==endBefore.hash)throw Error('Reorg during collection');
 
   // Verify runtime bytecode and PRINTER decimals before SQL commit.
   if (verifyContracts) await verifyChain(client, manifest, toBlock);
 
   return {
     expectedVersion: String(checkpoint.version),
-    blocks,
+    range:{fromBlock:start+1,toBlock},
+    blocks:[...blockMetadata]
+      .sort(([a],[b])=>a-b)
+      .map(([number,block])=>({number,hash:block.hash,parentHash:block.parentHash})),
     events: receipts
   };
 }

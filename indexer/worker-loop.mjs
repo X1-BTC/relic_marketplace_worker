@@ -8,7 +8,7 @@ import {WorkerFault} from './worker-config.mjs';
 // catchupBatchDelayMs — required by static check
 const jitter=ms=>Math.round(ms*(1+Math.random()*0.15));
 async function sleep(ms,signal){if(ms<=0)return;try{await delay(ms,undefined,{signal});}catch{if(!signal.aborted)throw new WorkerFault('TIMER_FAILED');}}
-const reorgMessage=e=>['Reorg: explicit recovery required','Reorg: recovery required','Reorg during collection'].includes(e?.message);
+const reorgMessage=e=>['Reorg: explicit recovery required','Reorg: recovery required','Reorg during collection','Reorg at verified range boundary','HyperSync rollback guard mismatch','HyperSync endpoint hash mismatch','HyperSync log/header mismatch','HyperSync canonical range invalid','Log block hash mismatch','Removed log; recover canonical checkpoint first'].includes(e?.message)||['HYPERSYNC_REORG_DETECTED'].includes(e?.code);
 const bytecodeMismatch=e=>/^Unauthorized (nft|printer|marketplace) bytecode$/.test(e?.message ?? '');
 const safeFailures=new Map([
   ['Batch must contain 1–1000 blocks','BATCH_RANGE_INVALID'],['Unconfirmed batch','BATCH_NOT_CONFIRMED'],
@@ -41,16 +41,17 @@ function wakeQueue() {
 
 function retryDelay(config,attempt){return jitter(Math.min(config.wsReconnectMaxMs,config.wsReconnectMinMs*2**Math.min(attempt-1,10)));}
 
-async function runLeader({config,session,pool,makeClient,signal,log,openSubscription,metrics,writerFactory,onHealthy}) {
+async function runLeader({config,session,pool,makeClient,makeLogSource,signal,log,openSubscription,metrics,writerFactory,onHealthy}) {
   const cycleSignal=AbortSignal.any([signal,session.signal]);
   const client=makeClient(cycleSignal);
+  const logSource=makeLogSource?.(cycleSignal);
   const writer=writerFactory({pool:session.pool,stream:config.stream,manifest:config.manifest});
   const wake=wakeQueue();
-  let lastIntegrityCheck=0;
+  let integrityVerified=false;
   const indexBatch=async options=>{
-    const verifyContracts=Date.now()-lastIntegrityCheck>=300000;
-    const result=await indexOnce({...options,verifyContracts,verifyIdle:verifyContracts});
-    if(verifyContracts)lastIntegrityCheck=Date.now();
+    const verifyContracts=!integrityVerified;
+    const result=await indexOnce({...options,logSource,verifyContracts,verifyIdle:verifyContracts});
+    if(verifyContracts)integrityVerified=true;
     return result;
   };
   const catchUp=async()=>{
@@ -59,10 +60,10 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       const head=await client.getBlockNumber();
       const cp=await writer.checkpoint();
       if(head-BigInt(config.confirmations)<=BigInt(cp.block_number)){
-        await indexBatch({client,writer,confirmations:config.confirmations,batchSize:config.batchSize,checkpoint:cp,head});
+        await indexBatch({client,writer,confirmations:config.confirmations,batchSize:1000,checkpoint:cp,head});
         return batches;
       }
-      const result=await indexBatch({client,writer,confirmations:config.confirmations,batchSize:config.batchSize,checkpoint:cp,head});
+      const result=await indexBatch({client,writer,confirmations:config.confirmations,batchSize:1000,checkpoint:cp,head});
       if(result.idle)return batches;
       batches++;
       if(config.catchupBatchDelayMs>0)await sleep(config.catchupBatchDelayMs,cycleSignal);
@@ -70,7 +71,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     return batches;
   };
   let handle=null,wsConnected=false,disconnectedAt=Date.now(),disconnectAlerted=false;
-  let reconnectFailures=0,nextReconnectAt=0,nextCatchupAt=0;
+  let reconnectFailures=0,nextReconnectAt=0,nextCatchupAt=0,nextConfirmAt=0,pendingEventBlock=0;
   const connect=async()=>{
     try{
       handle=await openSubscription({
@@ -103,8 +104,15 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     }
   };
 
-  // Subscribe first, then read from the durable checkpoint. Signals arriving
-  // during catch-up are coalesced and cause another canonical HTTP pass.
+  const recoverOnReorg=async error=>{
+    if(!reorgMessage(error))return false;
+    const cp=await writer.checkpoint();
+    await writer.recover({client,expectedVersion:cp.version});
+    return true;
+  };
+
+  // Subscribe first, then reconcile the durable gap. Signals are only wakeups;
+  // HyperSync remains the source of complete, bounded log ranges.
   try {
     await connect();
     if (cycleSignal.aborted) return { aborted: true };
@@ -113,22 +121,24 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
     while (!cycleSignal.aborted) {
       const now = Date.now();
 
-      // WebSocket logs are hints, not a durable block feed. Scan canonical
-      // blocks periodically so an idle marketplace still advances through
-      // empty blocks and a dropped notification cannot strand the checkpoint.
-      if (now >= nextCatchupAt) {
+      // WebSocket notifications wake confirmation processing. HyperSync runs
+      // periodically as a completeness check, even when no notification arrives.
+      if (now >= nextCatchupAt || (nextConfirmAt&&now>=nextConfirmAt)) {
         let catchupFailed=false;
         try {
           const batches=await catchUp();
           const latest=await writer.checkpoint();
           if(batches)log('progress',{checkpoint:String(latest.block_number),version:String(latest.version)});
+          if(pendingEventBlock&&Number(latest.block_number)>=pendingEventBlock){pendingEventBlock=0;nextConfirmAt=0;}
+          else if(pendingEventBlock)nextConfirmAt=Date.now()+5000;
           onHealthy?.();
         } catch (err) {
           catchupFailed=true;
+          try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
           console.error('[CATCHUP_FAILED]', err?.message || err);
           log('alert', { code: 'CATCHUP_FAILED' });
         }
-        nextCatchupAt = Date.now() + (catchupFailed?15000:Math.max(15000,config.wsFallbackMs));
+        nextCatchupAt = Date.now() + (catchupFailed?15000:Math.max(15000,config.hypersyncReconcileMs??config.wsFallbackMs));
       }
 
       if (!wsConnected && disconnectedAt && now - disconnectedAt >= config.alertStallMs && !disconnectAlerted) {
@@ -146,6 +156,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
             log('reconnect_scan', { from: cp.block_number, to: 'confirmed_head' });
             await catchUp();
           } catch (err) {
+            try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
             nextCatchupAt=Date.now()+15000;
             console.error('[RECONNECT_SCAN_FAILED]', err?.message || err);
             log('alert', { code: 'RECONNECT_SCAN_FAILED' });
@@ -155,19 +166,14 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
         }
       }
 
-      // Light catch-up while disconnected
+      // Reconnect timer only; recovery runs once the subscription is restored.
       if (!wsConnected) {
-        try {
-          await catchUp();
-        } catch (err) {
-          console.error('[DISCONNECTED_CATCHUP_FAILED]', err?.message || err);
-          log('alert', { code: 'DISCONNECTED_CATCHUP_FAILED' });
-        }
         await sleep(2000, cycleSignal);
         continue;
       }
 
-      const timeout = Math.min(60000,Math.max(1000,nextCatchupAt-Date.now()));
+      const dueAt=nextConfirmAt?Math.min(nextCatchupAt,nextConfirmAt):nextCatchupAt;
+      const timeout = Math.min(60000,Math.max(1000,dueAt-Date.now()));
       const signalResult = await wake.take(timeout, cycleSignal, handle?.closed);
 
       if (signalResult.kind === 'aborted') break;
@@ -181,11 +187,19 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
       if (signalResult.kind === 'timeout') continue;
 
       // Notification with blockNumber
+      if(signalResult.removed){
+        try{await writer.recover({client,expectedVersion:(await writer.checkpoint()).version});}
+        catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
+      }
       if (signalResult.blockNumber) {
+        pendingEventBlock=Math.max(pendingEventBlock,Number(signalResult.blockNumber));
         try {
           await catchUp();
-          log('event_processed', { block: signalResult.blockNumber });
+          const latest=await writer.checkpoint();
+          if(Number(latest.block_number)>=pendingEventBlock){pendingEventBlock=0;nextConfirmAt=0;log('event_processed', { block: signalResult.blockNumber });}
+          else {nextConfirmAt=Date.now()+Math.max(5000,config.confirmations*1000);log('event_pending_confirmation',{block:signalResult.blockNumber});}
         } catch (err) {
+          try{await recoverOnReorg(err);}catch{log('alert',{code:'REORG_RECOVERY_FAILED'});}
           nextCatchupAt=Date.now()+15000;
           console.error('[EVENT_PROCESS_FAILED]', err?.message || err);
           log('alert', { code: 'EVENT_PROCESS_FAILED' });
@@ -199,7 +213,7 @@ async function runLeader({config,session,pool,makeClient,signal,log,openSubscrip
   }
 }
 
-export async function runWorker({config,pool,makeClient,signal,log,onSession,openSubscription=openMarketplaceLogSubscription,metrics,writerFactory=options=>new PostgresMarketplaceWriter(options),onCycleError}) {
+export async function runWorker({config,pool,makeClient,makeLogSource,signal,log,onSession,openSubscription=openMarketplaceLogSubscription,metrics,writerFactory=options=>new PostgresMarketplaceWriter(options),onCycleError}) {
   let failures=0,standbyLogged=false;
   while(!signal.aborted){
     let session;
@@ -210,7 +224,7 @@ export async function runWorker({config,pool,makeClient,signal,log,onSession,ope
         await sleep(jitter(config.pollMs),signal);continue;
       }
       standbyLogged=false;onSession(session);log('leader',{serverVersion:session.version});
-      await runLeader({config,session,pool,makeClient,signal,log,openSubscription,metrics,writerFactory,onHealthy:()=>{failures=0;}});
+      await runLeader({config,session,pool,makeClient,makeLogSource,signal,log,openSubscription,metrics,writerFactory,onHealthy:()=>{failures=0;}});
       if(!signal.aborted)throw new WorkerFault('DATABASE_SESSION_LOST');
     }catch(error){
       if(signal.aborted)break;

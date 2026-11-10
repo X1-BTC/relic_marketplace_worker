@@ -12,6 +12,5 @@ export function marketplaceOnlyClient(base,manifest,metrics={action(){}}) {
     getBytecode:call('eth_getCode',args=>base.getBytecode(args)),
     readContract:call('eth_call',args=>base.readContract(args)),
     getTransactionReceipt:call('eth_getTransactionReceipt',args=>base.getTransactionReceipt(args)),
-    getLogs:call('eth_getLogs',args=>base.getLogs({...args,address:manifest.marketplace})),
   };
 }

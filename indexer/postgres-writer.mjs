@@ -45,13 +45,7 @@ export class PostgresMarketplaceWriter {
     return this.transaction(async db => {
       const cp = await this.locked(db, expectedVersion);
       if (Number(cp.block_number) >= blockNumber) return { unchanged: true };
-      const nextVersion = (BigInt(cp.version) + 1n).toString();
-      const advanced = await db.query(
-        `UPDATE relic_market_indexer.checkpoints SET block_number=$2, block_hash=$3, version=version+1 WHERE stream=$1 AND version=$4 RETURNING version`,
-        [this.stream, blockNumber, blockHash, cp.version]
-      );
-      if (advanced.rows.length !== 1) throw Error('Checkpoint advance compare-and-swap failed');
-      return { blockNumber, blockHash, version: nextVersion };
+      throw Error('Checkpoint advancement requires a verified journal commit');
     });
   }
   async locked(db,version) {
@@ -201,21 +195,24 @@ export class PostgresMarketplaceWriter {
     const input=copy(batch);
     return this.transaction(async db=>{
       const cp=await this.locked(db,input.expectedVersion);
-      let number=Number(cp.block_number), parent=cp.block_hash;
-      if(number<SNAPSHOT_BLOCK) throw Error('Checkpoint precedes protected snapshot');
-      await this.registry(db,number+1);
-      if (!input.blocks?.length || input.blocks.length > 1000) throw Error('Invalid block batch');
+      const start=Number(cp.block_number);
+      if(start<SNAPSHOT_BLOCK) throw Error('Checkpoint precedes protected snapshot');
+      if(!input.range||input.range.fromBlock!==start+1||!Number.isSafeInteger(input.range.toBlock)||input.range.toBlock<=start||input.range.toBlock-start>1000)throw Error('Invalid checked block range');
+      const number=input.range.toBlock;
+      await this.registry(db,start+1);
+      if (!input.blocks?.length || input.blocks.length > 1000) throw Error('Invalid sparse block journal');
       const hashes=new Map();
       for (const b of input.blocks) {
         integer(b.number); hash(b.hash); hash(b.parentHash);
-        if (b.number !== number+1 || b.parentHash !== parent) throw Error('Reorg/gap: recover before advancing');
-        number=b.number; parent=b.hash; hashes.set(number,parent);
-        await db.query('INSERT INTO relic_market_indexer.blocks(stream,block_number,block_hash,parent_hash) VALUES($1,$2,$3,$4)',[this.stream,number,parent,b.parentHash]);
+        if (b.number<=start || b.number>number || hashes.has(b.number)) throw Error('Invalid sparse block metadata');
+        hashes.set(b.number,b.hash);
       }
+      const parent=hashes.get(number);
+      if(!parent)throw Error('Checked range endpoint metadata missing');
       const unique=new Map(); const positions=new Set();
       for (const raw of input.events) {
         const e=normalizeLog(raw); const key=eventKey(e);
-        if (hashes.get(e.blockNumber) !== e.blockHash) throw Error('Event outside canonical batch');
+        if (e.blockNumber<=start || e.blockNumber>number || hashes.get(e.blockNumber) !== e.blockHash) throw Error('Event outside canonical batch');
         if (unique.has(key)) { if (json(unique.get(key)) !== json(e)) throw Error('Conflicting duplicate'); continue; }
         const position=`${e.blockNumber}:${e.logIndex}`;
         if (positions.has(position)) throw Error('Conflicting block log position'); positions.add(position);
@@ -227,6 +224,7 @@ export class PostgresMarketplaceWriter {
         const bucket=eventsByBlock.get(event.blockNumber);
         if(bucket)bucket.push(event);else eventsByBlock.set(event.blockNumber,[event]);
       }
+      for(const block of input.blocks)await db.query('INSERT INTO relic_market_indexer.blocks(stream,block_number,block_hash,parent_hash) VALUES($1,$2,$3,$4)',[this.stream,block.number,block.hash,block.parentHash]);
       const nextVersion=(BigInt(cp.version)+1n).toString();
       await this.setVolumeCheckpoint(db,nextVersion,number,parent);
       const state={listings:{},offers:{},sales:{},transfers:{}};

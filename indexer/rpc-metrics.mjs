@@ -1,4 +1,4 @@
-const methods=['eth_blockNumber','eth_chainId','eth_getBlockByNumber','eth_getLogs','eth_getTransactionReceipt','eth_getCode','eth_call'];
+const methods=['eth_blockNumber','eth_chainId','eth_getBlockByNumber','eth_getTransactionReceipt','eth_getCode','eth_call'];
 
 // Counts client actions separately from transport requests. No request URL,
 // body, response, transaction hash, or provider diagnostic is retained.

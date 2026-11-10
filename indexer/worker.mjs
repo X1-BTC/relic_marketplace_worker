@@ -3,6 +3,7 @@ import {createServerWriterPool} from './server-pool.mjs';
 import {marketplaceOnlyClient} from './marketplace-only-client.mjs';
 import {createCountingFetch,createRpcMetrics} from './rpc-metrics.mjs';
 import {runWorker} from './worker-loop.mjs';
+import {HyperSyncLogSource} from './hypersync-client.mjs';
 import {PRODUCTION_CONFIG} from '../shared/production-config.mjs';
 
 // Closed log vocabulary: never pass error.message, stack, URL, env, manifest,
@@ -13,14 +14,14 @@ const events=new Set([
   'shutdown_deadline','ws_connected','ws_disconnected',
   'ws_reconnect_failed','reorg_signal','rpc_metrics','alert',
   // Ajouts pour les logs d’activité actuels
-  'checkpoint_advanced','reconnect_scan','event_processed'
+  'checkpoint_advanced','reconnect_scan','event_processed','event_pending_confirmation'
 ]);
 const fields=new Set([
   'code','errorMessage','serverVersion','head','checkpoint',
   'lagBlocks','version','attempt','delayMs','durationMs','batches',
   'httpFetchCalls','wsConnectionAttempts','wsRequestsOut',
   'wsMessagesIn','wsNotifications','eth_blockNumber','eth_chainId',
-  'eth_getBlockByNumber','eth_getLogs','eth_getTransactionReceipt',
+  'eth_getBlockByNumber','eth_getTransactionReceipt',
   'eth_getCode','eth_call',
   // Ajouts pour les nouveaux événements
   'block','from','to'
@@ -66,8 +67,9 @@ try {
       transport:viem.http(config.httpRpcUrl,{retryCount:0,timeout:15000,batch:false,fetchFn:createCountingFetch(metrics),fetchOptions:{signal}}),
       cacheTime:0,
     }),config.manifest,metrics);
+    const makeLogSource=signal=>new HyperSyncLogSource({apiToken:config.envioApiToken,signal});
     log('starting');
-    await runWorker({config,pool,makeClient,signal:stop.signal,log,onSession:value=>{session=value;},metrics});
+    await runWorker({config,pool,makeClient,makeLogSource,signal:stop.signal,log,onSession:value=>{session=value;},metrics});
   }
 }catch(error){
   if(!stop.signal.aborted){log('fatal',{code:error instanceof WorkerFault?error.code:'WORKER_FAILED'});process.exitCode=1;}

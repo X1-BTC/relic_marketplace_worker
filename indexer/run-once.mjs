@@ -2,7 +2,7 @@ import {integer, readBatch, verifyChain} from './marketplace.mjs';
 
 // Explicit invocation only. The caller supplies a viem read client and a local
 // PostgreSQL writer. No timer, environment lookup, deployment or auto migration.
-export async function indexOnce({client, writer, confirmations=12, batchSize=100, checkpoint:knownCheckpoint=null, head:knownHead=null, verifyIdle=true, verifyContracts=true}) {
+export async function indexOnce({client, writer, logSource=null, confirmations=12, batchSize=100, checkpoint:knownCheckpoint=null, head:knownHead=null, verifyIdle=true, verifyContracts=true}) {
   integer(confirmations);
   integer(batchSize);
   if (confirmations < 1 || batchSize < 1 || batchSize > 1000) throw Error('Invalid indexer bounds');
@@ -17,6 +17,6 @@ export async function indexOnce({client, writer, confirmations=12, batchSize=100
     return {idle:true,checkpoint};
   }
   const end=confirmed < BigInt(start+batchSize) ? Number(confirmed) : start+batchSize;
-  const batch=await readBatch({client,manifest:writer.manifest,checkpoint,toBlock:end,confirmations,head,anchor,verifyContracts});
+  const batch=await readBatch({client,manifest:writer.manifest,checkpoint,toBlock:end,confirmations,head,anchor,logSource,verifyContracts});
   return writer.commit(batch);
 }

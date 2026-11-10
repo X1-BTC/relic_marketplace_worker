@@ -49,10 +49,12 @@ export function readWorkerConfig(env) {
   const wsAlchemy=alchemyEndpoint(env,'RM_MARKETPLACE_ALCHEMY_WS_URL','wss:','DEDICATED_ALCHEMY_WS_REQUIRED');
   if(httpAlchemy.pathname!==wsAlchemy.pathname)invalid('alchemy_keys_mismatch');
   const result={enabled:true,manifest,stream,connection,login,httpRpcUrl:httpAlchemy.href,wsRpcUrl:wsAlchemy.href,
+    envioApiToken:required(env,'ENVIO_API_TOKEN'),
     pollMs:number(env,'RM_POLL_INTERVAL_MS',60000,15000,300000),
     batchSize:number(env,'RM_BATCH_SIZE',10,1,100),
     confirmations:number(env,'RM_CONFIRMATIONS',12,1,1000),
     wsFallbackMs:number(env,'RM_WS_FALLBACK_INTERVAL_MS',300000,30000,1800000),
+    hypersyncReconcileMs:number(env,'RM_HYPERSYNC_RECONCILE_INTERVAL_MS',300000,30000,1800000),
     wsReconnectMinMs:number(env,'RM_WS_RECONNECT_MIN_MS',1000,250,30000),
     wsReconnectMaxMs:number(env,'RM_WS_RECONNECT_MAX_MS',30000,1000,300000),
     catchupBatchDelayMs:number(env,'RM_CATCHUP_BATCH_DELAY_MS',1000,0,60000),
