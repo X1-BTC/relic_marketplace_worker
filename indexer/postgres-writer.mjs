@@ -1,4 +1,4 @@
-import {copy,json,validateManifest,manifestDigest,normalizeLog,eventKey,project,hash,integer,verifyChain} from './marketplace.mjs';
+import {copy,json,validateManifest,manifestDigest,normalizeLog,eventKey,project,decode,hash,integer,verifyChain} from './marketplace.mjs';
 import {SNAPSHOT_BLOCK, rawPayload, rawRow, businessRows, entityReferences, upsertBusinessRow} from './business-tables.mjs';
 
 export class PostgresMarketplaceWriter {
@@ -191,6 +191,28 @@ export class PostgresMarketplaceWriter {
     }
     await db.query('INSERT INTO relic_market_indexer.events(stream,transaction_hash,log_index,block_number) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[this.stream,e.transactionHash,e.logIndex,e.blockNumber]);
   }
+  async assertHistoricalProjectionOwnership(db,events,refs){
+    const marketTransactions=new Set(events.filter(e=>e.address===this.manifest.marketplace.toLowerCase()).map(e=>e.transactionHash));
+    for(const e of events){
+      const d=decode(e,this.manifest);if(!d)continue;
+      const checks=[];
+      if(e.address===this.manifest.marketplace.toLowerCase()||(d.name==='PrinterTransfer'&&marketTransactions.has(e.transactionHash)))checks.push(['relic_market_activity','transaction_hash','log_index']);
+      if(['PlatformFeeInfoUpdated','FlatPlatformFeeUpdated','PlatformFeeTypeUpdated','RoyaltyEngineUpdated'].includes(d.name))checks.push(['relic_market_config_events','transaction_hash','log_index']);
+      if(['NewSale','AcceptedOffer'].includes(d.name))checks.push(['relic_market_settlements','transaction_hash','sale_log_index']);
+      if(d.name==='PrinterTransfer')checks.push(['relic_market_payment_transfers','transaction_hash','log_index']);
+      for(const [table,txColumn,logColumn] of checks){
+        const result=await db.query(`SELECT 1 FROM public.${table} WHERE chain_id=4663 AND ${txColumn}=$1 AND ${logColumn}=$2 LIMIT 1`,[e.transactionHash,e.logIndex]);
+        if(result.rows.length)throw Error('Historical replay found an unjournaled projection conflict');
+      }
+    }
+    for(const [kind,ids] of [['listings',refs.listings],['offers',refs.offers]])if(ids.length){
+      const table=kind==='listings'?'relic_market_listings':'relic_market_offers',id=kind==='listings'?'listing_id':'offer_id';
+      const result=await db.query(`SELECT 1 FROM public.${table} p WHERE p.chain_id=4663 AND p.marketplace_address=$1 AND p.${id}=ANY($2::numeric[])
+        AND NOT EXISTS(SELECT 1 FROM relic_market_indexer.events j WHERE j.stream=$3 AND j.chain_id=4663 AND j.transaction_hash=p.last_transaction_hash AND j.log_index=p.last_log_index) LIMIT 1`,
+        [this.manifest.marketplace.toLowerCase(),ids,this.stream]);
+      if(result.rows.length)throw Error('Historical replay found an entity projection outside its journal');
+    }
+  }
   async commit(batch) {
     const input=copy(batch);
     return this.transaction(async db=>{
@@ -268,8 +290,6 @@ export class PostgresMarketplaceWriter {
         const saved=await db.query('SELECT block_hash,parent_hash FROM relic_market_indexer.blocks WHERE stream=$1 AND block_number=$2',[this.stream,b.number]);
         if(saved.rows.length!==1||saved.rows[0].block_hash!==b.hash||saved.rows[0].parent_hash!==b.parentHash)throw Error('Historical replay canonical anchor conflict');
       }
-      const {rows:maxRows}=await db.query('SELECT max(block_number) AS block_number FROM relic_market_indexer.events WHERE stream=$1',[this.stream]);
-      let latest=maxRows[0]?.block_number==null?null:Number(maxRows[0].block_number);
       const eventsByBlock=new Map();
       for(const e of ordered){const group=eventsByBlock.get(e.blockNumber)??[];group.push(e);eventsByBlock.set(e.blockNumber,group);}
       for(const [number,events] of eventsByBlock){
@@ -280,15 +300,28 @@ export class PostgresMarketplaceWriter {
           for(const e of events)await this.ingest(db,e); // validates ownership and byte-for-byte identity
           continue;
         }
-        if(latest!==null&&number<=latest)throw Error('Historical replay would insert before existing journal history');
-        for(const e of events)await this.ingest(db,e);
         const refs=entityReferences(events,this.manifest);
+        if(refs.listings.length||refs.offers.length){
+          const projectedLater=await db.query(`SELECT
+            EXISTS(SELECT 1 FROM public.relic_market_listings WHERE chain_id=4663 AND marketplace_address=$1 AND listing_id=ANY($2::numeric[]) AND last_block_number>$3)
+            OR EXISTS(SELECT 1 FROM public.relic_market_offers WHERE chain_id=4663 AND marketplace_address=$1 AND offer_id=ANY($4::numeric[]) AND last_block_number>$3) AS conflict`,
+            [this.manifest.marketplace.toLowerCase(),refs.listings,number,refs.offers]);
+          if(projectedLater.rows[0]?.conflict===true)throw Error('Historical replay conflicts with a later projected entity state');
+          const later=await db.query(`SELECT r.event_name,r.decoded FROM relic_market_indexer.events j
+            JOIN public.relic_market_raw_events r ON r.chain_id=j.chain_id AND r.transaction_hash=j.transaction_hash AND r.log_index=j.log_index
+            WHERE j.stream=$1 AND j.block_number>$2 AND (
+              (r.event_name=ANY($3::text[]) AND r.decoded->>'listingId'=ANY($4::text[])) OR
+              (r.event_name=ANY($5::text[]) AND r.decoded->>'offerId'=ANY($6::text[]))) LIMIT 1`,
+            [this.stream,number,['NewListing','UpdatedListing','CancelledListing','NewSale'],refs.listings,['NewOffer','CancelledOffer','AcceptedOffer'],refs.offers]);
+          if(later.rows.length)throw Error('Historical replay conflicts with a later transition for the same entity');
+        }
+        await this.assertHistoricalProjectionOwnership(db,events,refs);
+        for(const e of events)await this.ingest(db,e);
         const seed=await this.captureEntityUndo(db,number,refs);
         let projected,rows;
         try{projected=project(events,this.manifest,seed);}catch(error){error.indexerReason=`Historical replay projection: ${String(error.message).slice(0,120)}`;throw error;}
         try{rows=businessRows(events,projected,this.manifest,this.stream);}catch(error){error.indexerReason=`Historical replay mapping: ${String(error.message).slice(0,120)}`;throw error;}
         for(const table of ['relic_market_activity','relic_market_config_events','relic_market_listings','relic_market_offers','relic_market_settlements','relic_market_payment_transfers'])for(const row of rows[table])await upsertBusinessRow(db,table,row,this.stream);
-        latest=number;
       }
       return {unchangedCheckpoint:true,blockNumber:Number(cp.block_number),version:String(cp.version),replayedBlocks:eventsByBlock.size,replayedEvents:ordered.length};
     });

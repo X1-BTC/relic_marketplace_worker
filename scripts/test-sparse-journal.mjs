@@ -370,6 +370,7 @@ function rpc({logs=[],orphan=false}={}){
     if(text.includes('SELECT block_hash,parent_hash FROM relic_market_indexer.blocks'))return {rows:[storedBlocks.get(values[1])]};
     if(text.includes('SELECT max(block_number) AS block_number'))return {rows:[{block_number:journalCount?eventBlock:null}]};
     if(text.includes('SELECT count(*)::text AS count FROM relic_market_indexer.events'))return {rows:[{count:String(journalCount)}]};
+    if(text.includes('SELECT 1 FROM public.relic_market_'))return {rows:[]};
     if(text.includes('INSERT INTO public.relic_market_raw_events')){if(firstInsert){firstInsert=false;return {rows:[{chain_id:4663}]};}return {rows:[]};}
     if(text.includes('SELECT r.*,j.stream AS owner_stream'))return {rows:[{...rawRow(event,manifest),topics:event.topics,owner_stream:'relic-mainnet'}]};
     if(text.includes('INSERT INTO relic_market_indexer.events')){journalCount++;return {rows:[]};}
@@ -378,6 +379,7 @@ function rpc({logs=[],orphan=false}={}){
     throw Error(`Unexpected SQL in historical replay test: ${text}`);
   },release(){}};
   const writer=new PostgresMarketplaceWriter({pool:{connect:async()=>db},stream:'relic-mainnet',manifest});
+  await assert.rejects(writer.assertHistoricalProjectionOwnership({async query(){return {rows:[{existing:true}]};}},[event],{listings:[],offers:[]}),/unjournaled projection conflict/);
   const result=await writer.replayHistorical({expectedVersion:'7',range:{fromBlock:base+1,toBlock:base+20},
     blocks:[{number:eventBlock,hash:H(eventBlock),parentHash:H(eventBlock-1)},{number:base+20,hash:H(base+20),parentHash:H(base+19)}],events:[event]});
   assert.equal(result.unchangedCheckpoint,true);
@@ -389,6 +391,26 @@ function rpc({logs=[],orphan=false}={}){
   assert.ok(sql.some(text=>text.includes('entity_undo'))===false,'configuration-only history requires no entity undo rows');
   assert.ok(!sql.some(text=>text.includes('UPDATE relic_market_indexer.checkpoints')),'historical replay never rewinds or advances checkpoint');
   await assert.rejects(writer.replayHistorical({expectedVersion:'7',range:{fromBlock:base+1,toBlock:base+101},blocks:[{number:base+101,hash:H(base+101),parentHash:H(base+100)}],events:[]}),/Indexer transaction failed/);
+
+  const listingTuple={listingId:'33',tokenId:'44',quantity:'1',pricePerToken:'100',startTimestamp:'1700000000',endTimestamp:((1n<<128n)-1n).toString(),listingCreator:'0x0000000000000000000000000000000000000033',assetContract:manifest.nft,currency:manifest.printer,tokenType:'0',status:'1',reserved:false};
+  const listingEncoded=marketEvents.encodeEventLog(marketEvents.getEvent('NewListing'),[listingTuple.listingCreator,'33',manifest.nft,listingTuple]);
+  const oldEntityEvent={...event,transactionHash:H(902),topics:listingEncoded.topics,data:listingEncoded.data};
+  const conflictSql=[];
+  const conflictDb={async query(text){conflictSql.push(text);if(['BEGIN','COMMIT','ROLLBACK'].includes(text))return {rows:[]};
+    if(text.includes('SELECT * FROM relic_market_indexer.checkpoints'))return {rows:[{...checkpoint,block_number:base+100,block_hash:H(base+100)}]};
+    if(text.includes('FROM public.relic_market_contracts'))return {rows:[{role:'MARKETPLACE_V3',contract_address:manifest.marketplace,start_block:base},{role:'PRINTER',contract_address:manifest.printer,start_block:base},{role:'RELIC_NFT',contract_address:manifest.nft,start_block:base}]};
+    if(text.includes('INSERT INTO relic_market_indexer.blocks'))return {rows:[]};
+    if(text.includes('SELECT block_hash,parent_hash FROM relic_market_indexer.blocks'))return {rows:[{block_hash:H(eventBlock),parent_hash:H(eventBlock-1)}]};
+    if(text.includes('SELECT count(*)::text AS count FROM relic_market_indexer.events'))return {rows:[{count:'0'}]};
+    if(text.includes('SELECT 1 FROM public.relic_market_'))return {rows:[]};
+    if(text.includes('AS conflict'))return {rows:[{conflict:false}]};
+    if(text.includes('r.event_name=ANY'))return {rows:[{event_name:'UpdatedListing',decoded:{listingId:'33'}}]};
+    throw Error(`Unexpected SQL in later-entity conflict test: ${text}`);
+  },release(){}};
+  const guardedWriter=new PostgresMarketplaceWriter({pool:{connect:async()=>conflictDb},stream:'relic-mainnet',manifest});
+  await assert.rejects(guardedWriter.replayHistorical({expectedVersion:'7',range:{fromBlock:eventBlock,toBlock:eventBlock},blocks:[{number:eventBlock,hash:H(eventBlock),parentHash:H(eventBlock-1)}],events:[oldEntityEvent]}),/Indexer transaction failed/);
+  assert.ok(conflictSql.includes('ROLLBACK'),'a later transition conflict rolls back historical replay');
+  assert.ok(!conflictSql.some(text=>text.includes('INSERT INTO public.relic_market_raw_events')),'conflicting historical entity replay writes no partial raw event');
 }
 
 // Reorg rollback falls back from orphan event/checkpoint rows to a canonical sparse boundary.

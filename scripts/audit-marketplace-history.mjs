@@ -20,7 +20,7 @@ export const TARGETED_TRANSACTIONS=Object.freeze([
   {block:100786855,hash:'0x60ecae79edc341c6e19d672ac819f8060c606f8707422aada60d0e7468a6b84f'},
   {block:100792665,hash:'0x1b2cab93fbfc64f44d5dd4d07cbbc80d213e8597a4ef7f44e5ee2cc9812c544a'},
   {block:100803626,hash:'0xab3008e3570893a8f2c956fa92385101292e4ecc6d274cbd8bab57e248d71fcc'},
-  {block:100809473,hash:'0xd8da80961e134a5231cd91d54d4d759caa8056bb128cca791e32d8a6992c10'},
+  {block:100809473,hash:'0xd8da80961e134a5231cd91d54d4d4d759caa8056bb128cca791e32d8a6992c10'},
   {block:100813966,hash:'0xa37502403ec62ce5b7458e06b1e097d4f242dbd27b9aaa2a3c623437b58fc35f'},
   {block:100830176,hash:'0x68f725827ccdb782cd2a531eec1195da0f1ce61a912f50a9b2f18be2d3f59bef'},
   {block:101762900,hash:'0xba8739d4bcda7dda5da929190289ea37e438af71cb41989bf8ebdbb77b99bdf3'},
@@ -258,6 +258,9 @@ async function runTargeted(){
     const [chainId,head,checkpoint,dbMeta]=await Promise.all([
       client.getChainId(),client.getBlockNumber(),
       readOnly(pool,async db=>{
+        const cols=await db.query(`SELECT column_name FROM information_schema.columns WHERE table_schema='relic_market_indexer' AND table_name='checkpoints'`);
+        const available=new Set(cols.rows.map(x=>x.column_name));
+        if(['stream','chain_id','anchor_number','anchor_hash','block_number','block_hash','version','manifest_digest','manifest'].some(x=>!available.has(x)))throw Error('AUDIT_CHECKPOINT_SCHEMA_UNSUPPORTED');
         const q=await db.query(`SELECT stream,chain_id,anchor_number,anchor_hash,block_number,block_hash,version,manifest_digest,manifest FROM relic_market_indexer.checkpoints WHERE stream=$1`,[config.stream]);
         if(q.rows.length!==1)throw Error('AUDIT_CHECKPOINT_NOT_UNIQUE');
         const cp=q.rows[0];
@@ -279,6 +282,8 @@ async function runTargeted(){
       }),
     ]);
     if(chainId!==4663)throw Error('AUDIT_CHAIN_ID_MISMATCH');
+    const checkpointBoundary=await client.getBlock({blockNumber:BigInt(checkpoint.block_number)});
+    if(checkpointBoundary.hash.toLowerCase()!==checkpoint.block_hash.toLowerCase())throw Error('AUDIT_CHECKPOINT_NOT_CANONICAL');
     const verified=[];
     for(const expected of TARGETED_TRANSACTIONS){
       // Exactly one receipt lookup per supplied hash; no eth_getLogs requests.
@@ -310,11 +315,30 @@ async function runTargeted(){
         FROM s ORDER BY s.block_number,s.transaction_hash,s.log_index`,[...arrays,config.stream,config.manifest.marketplace.toLowerCase(),config.manifest.printer.toLowerCase()]);
       return q.rows;
     });
+    const saleChecks=[];
+    for(const expectedSale of projection.rows.relic_market_settlements){
+      const actual=await readOnly(pool,async db=>{
+        const settlement=await db.query(`SELECT sale_log_index,reconcile_status,listing_id,offer_id,nft_contract,token_id,buyer_address,seller_address,currency_address,currency_decimals,gross_amount_raw,seller_proceeds_raw,platform_fee_raw,thirdweb_fee_raw,royalty_fee_raw,marketplace_residual_raw
+          FROM public.relic_market_settlements WHERE chain_id=4663 AND marketplace_address=$1 AND transaction_hash=$2 AND sale_log_index=$3`,[config.manifest.marketplace.toLowerCase(),expectedSale.transaction_hash,expectedSale.sale_log_index]);
+        const payments=await db.query(`SELECT log_index,token_contract,from_address,to_address,amount_raw,payment_role FROM public.relic_market_payment_transfers
+          WHERE chain_id=4663 AND transaction_hash=$1 ORDER BY log_index`,[expectedSale.transaction_hash]);
+        const nft=await db.query(`SELECT log_index,decoded FROM public.relic_market_raw_events WHERE chain_id=4663 AND transaction_hash=$1 AND lower(contract_address)=$2 AND event_name='NFTTransfer' ORDER BY log_index`,[expectedSale.transaction_hash,config.manifest.nft.toLowerCase()]);
+        return {settlement:settlement.rows[0]??null,payments:payments.rows,nft:nft.rows};
+      });
+      const expectedPayments=projection.rows.relic_market_payment_transfers.filter(x=>x.transaction_hash===expectedSale.transaction_hash).map(x=>({log_index:Number(x.log_index),token_contract:x.token_contract,from_address:x.from_address,to_address:x.to_address,amount_raw:String(x.amount_raw),payment_role:x.payment_role})).sort((a,b)=>a.log_index-b.log_index);
+      const actualPayments=actual.payments.map(x=>({log_index:Number(x.log_index),token_contract:x.token_contract,from_address:x.from_address,to_address:x.to_address,amount_raw:String(x.amount_raw),payment_role:x.payment_role})).sort((a,b)=>a.log_index-b.log_index);
+      const expectedNft=events.filter(e=>e.transactionHash===expectedSale.transaction_hash&&e.address===config.manifest.nft.toLowerCase()).map(e=>{const d=decode(e,config.manifest);return d?.name==='NFTTransfer'?{log_index:e.logIndex,from_address:d.args.from,to_address:d.args.to,token_id:String(d.args.value)}:null;}).filter(Boolean);
+      const actualNft=actual.nft.map(x=>({log_index:Number(x.log_index),from_address:x.decoded?.from,to_address:x.decoded?.to,token_id:String(x.decoded?.value)}));
+      const settlementFields=['sale_log_index','reconcile_status','listing_id','offer_id','nft_contract','token_id','buyer_address','seller_address','currency_address','currency_decimals','gross_amount_raw','seller_proceeds_raw','platform_fee_raw','thirdweb_fee_raw','royalty_fee_raw','marketplace_residual_raw'];
+      const normalizedSettlement=row=>row&&Object.fromEntries(settlementFields.map(k=>[k,row[k]==null?null:String(row[k])]));
+      const matches=JSON.stringify(normalizedSettlement(actual.settlement))===JSON.stringify(normalizedSettlement(expectedSale))&&JSON.stringify(actualPayments)===JSON.stringify(expectedPayments)&&JSON.stringify(actualNft)===JSON.stringify(expectedNft);
+      saleChecks.push({transactionHash:expectedSale.transaction_hash,logIndex:expectedSale.sale_log_index,expected:{settlement:normalizedSettlement(expectedSale),payments:expectedPayments,nft:expectedNft},actual:{settlement:normalizedSettlement(actual.settlement),payments:actualPayments,nft:actualNft},matches});
+    }
     const missing=dbCompare.filter(x=>!x.journal_present||!x.raw_present||!x.activity_present||!x.entity_present||!x.specialized_present||!x.payment_present).map(x=>({blockNumber:String(x.block_number),transactionHash:x.transaction_hash,logIndex:x.log_index,eventName:x.event_name,kind:x.kind,missing:{...(!x.journal_present&&{journal:true}),...(!x.raw_present&&{raw:true}),...(!x.activity_present&&{activity:true}),...(!x.entity_present&&{entity:true}),...(!x.specialized_present&&{specialized:true}),...(!x.payment_present&&{paymentTransfer:true})}}));
     const types={};for(const x of classifications){const d=decode(x.log,config.manifest);types[d?.name??x.eventName]=(types[d?.name??x.eventName]??0)+1;}
     const receiptSummary=verified.map(x=>({block:x.expected.block,transactionHash:x.expected.hash,status:'success',blockHash:x.block.hash,transactionIndex:Number(x.receipt.transactionIndex),marketplaceLogs:x.logs.filter(l=>l.address===config.manifest.marketplace.toLowerCase()).length,relevantLogs:x.logs.length}));
-    const replayReady=projection.ambiguous.length===0&&missing.length>0&&missing.every(x=>x.missing.journal||x.missing.raw);
-    out('targeted_audit_summary',{mode:'targeted_receipts_only',chainId,head:String(head),confirmationsRequired:12,transactions:receiptSummary,eventCountsByDecodedType:types,receiptLogCount:events.length,duplicateIdentitiesRemoved:allLogs.length-events.length,missingDatabaseIdentities:missing,ambiguousSettlements:projection.ambiguous.map(x=>({transactionHash:x.transaction_hash,logIndex:x.sale_log_index,status:x.reconcile_status})),existingDatabase:dbMeta,checkpoint:{blockNumber:String(checkpoint.block_number),version:String(checkpoint.version)},configurationSource:'RM_MARKETPLACE_MANIFEST validated and digest matched against checkpoint; contract registry independently verified',rpc:{receiptLookups:11,canonicalBlockReads:11,ethGetLogs:0},replayReady,replayNotReadyReason:replayReady?null:projection.ambiguous.length?'AMBIGUOUS_SETTLEMENT':'NO_MISSING_EVENT_IDENTITY_OR_PROJECTION_ONLY_MISSING',replayBatches,fullHistoryAdministrativeCompleteness:'NOT_ESTABLISHED_BY_TARGETED_RECEIPTS',databaseWrites:0});
+    const replayReady=projection.ambiguous.length===0&&missing.length>0&&missing.every(x=>x.missing.journal&&x.missing.raw);
+    out('targeted_audit_summary',{mode:'targeted_receipts_only',chainId,head:String(head),confirmationsRequired:12,transactions:receiptSummary,eventCountsByDecodedType:types,receiptLogCount:events.length,duplicateIdentitiesRemoved:allLogs.length-events.length,missingDatabaseIdentities:missing,ambiguousSettlements:projection.ambiguous.map(x=>({transactionHash:x.transaction_hash,logIndex:x.sale_log_index,status:x.reconcile_status})),financialValidation:{allSalesMatch:saleChecks.every(x=>x.matches),sales:saleChecks},existingDatabase:dbMeta,checkpoint:{blockNumber:String(checkpoint.block_number),version:String(checkpoint.version),canonicalHash:checkpointBoundary.hash},configurationSource:'RM_MARKETPLACE_MANIFEST validated and digest matched against checkpoint; contract registry independently verified',rpc:{receiptLookups:11,canonicalBlockReads:12,checkpointBoundaryReads:1,ethGetLogs:0},replayReady,replayNotReadyReason:replayReady?null:projection.ambiguous.length?'AMBIGUOUS_SETTLEMENT':missing.length?'PARTIAL_IDENTITY_OR_PROJECTION_CONFLICT':'NO_MISSING_IDENTITIES',replayBatches,fullHistoryAdministrativeCompleteness:'NOT_ESTABLISHED_BY_TARGETED_RECEIPTS',databaseWrites:0});
   }finally{await pool.end();}
 }
 

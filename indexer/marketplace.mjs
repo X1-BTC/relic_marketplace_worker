@@ -373,6 +373,7 @@ function reconcile(state, m) {
         t.kind === 'NFTTransfer' &&
         t.value === sale.tokenId &&
         t.from === sale.seller &&
+        t.to === sale.payer &&
         !/^0x0{40}$/.test(t.to)
     );
 
@@ -398,13 +399,8 @@ function reconcile(state, m) {
 
     const total = BigInt(sale.totalPrice);
 
-    const unknown = [...net].some(
-      ([account, delta]) =>
-        delta !== 0n &&
-        account !== sale.payer &&
-        account !== sale.seller &&
-        !roles.has(account)
-    );
+    const unknown = transfers.some(([, t]) => t.kind === 'PrinterTransfer' && BigInt(t.value) !== 0n &&
+      [t.from,t.to].some(account => account !== sale.payer && account !== sale.seller && !roles.has(account)));
 
     if (
       nft.length !== 1 ||
@@ -412,10 +408,6 @@ function reconcile(state, m) {
       net.get(sale.payer) !== -total ||
       [...net].some(([account, delta]) => account !== sale.payer && delta < 0n)
     ) {
-      continue;
-    }
-
-    if (sale.kind === 'AcceptedOffer' && nft[0][1].to !== sale.payer) {
       continue;
     }
 
